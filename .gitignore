@@ -1,0 +1,39 @@
+# Rust / Cargo build artifacts
+/target/
+**/*.rs.bk
+Cargo.lock
+
+# Compiled binaries (generated via GitHub Actions pipeline)
+/bin/
+/bin_win/
+/bin_linux/
+*.exe
+*.dll
+*.so
+*.dylib
+*.pdb
+
+# Recorded SDF logfiles
+/logfile/*.sdf
+/logfile/*.tmp
+*.sdf
+
+# Local runtime user settings (keep settings.default.json tracked)
+/config/settings.json
+
+# Test & coverage outputs
+/coverage/
+lcov.info
+*.profraw
+*.profdata
+tarpaulin-report.*
+cobertura.xml
+
+# IDE & OS files
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+Thumbs.db

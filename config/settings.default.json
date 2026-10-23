@@ -1,0 +1,24 @@
+{
+  "connection": {
+    "target_ip": "127.0.0.1",
+    "target_port": 5555,
+    "transport": "Udp",
+    "connect_timeout_ms": 2000,
+    "local_a2l_fallback_path": ""
+  },
+  "recording": {
+    "default_log_folder": "./logfile",
+    "default_file_prefix": "Measurement",
+    "max_logfile_size_mb": 500,
+    "prefer_target_utc_clock": true
+  },
+  "calibration": {
+    "watch_list": [],
+    "verify_readback": true,
+    "active_cal_page": 0
+  },
+  "ui": {
+    "dark_mode": true,
+    "enable_mock_server": false
+  }
+}
