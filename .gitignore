@@ -1,7 +1,6 @@
 # Rust / Cargo build artifacts
 /target/
 **/*.rs.bk
-Cargo.lock
 
 # Compiled binaries (generated via GitHub Actions pipeline)
 /bin/
