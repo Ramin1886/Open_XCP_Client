@@ -5,11 +5,35 @@ use crate::a2l::lexer::{parse_i64_literal, parse_u64_literal, tokenize_a2l, A2lT
 use crate::a2l::model::{
     A2lDataType, A2lEvent, A2lModel, Characteristic, CharacteristicType, CompuMethod, CompuType,
     Instance, Measurement, StructureComponent, TypedefCharacteristic, TypedefMeasurement,
-    TypedefStructure,
+    TypedefStructure, MAX_ELEMENTS_PER_SIGNAL,
 };
 use crate::a2l::struct_resolver::{build_measurement_hierarchy, resolve_a2l_structures};
 use std::collections::BTreeMap;
 use thiserror::Error;
+
+/// Consumes the numeric literals that follow a `MATRIX_DIM`-style keyword, starting at `start`.
+/// Every positive dimension is pushed to `out`; the index of the first non-numeric token is returned.
+fn consume_matrix_dims(body: &[A2lToken<'_>], start: usize, out: &mut Vec<usize>) -> usize {
+    let mut idx = start;
+    while idx < body.len() {
+        match parse_u64_literal(body[idx].as_str()) {
+            Some(dim) => {
+                if dim > 0 {
+                    // Clamp each dimension so a hostile or broken A2L cannot request absurd
+                    // element counts; the product is bounded again in `element_count()`.
+                    out.push(
+                        usize::try_from(dim)
+                            .unwrap_or(usize::MAX)
+                            .min(MAX_ELEMENTS_PER_SIGNAL),
+                    );
+                }
+                idx += 1;
+            }
+            None => break,
+        }
+    }
+    idx
+}
 
 /// Errors produced when parsing an A2L file.
 #[derive(Debug, Error, PartialEq, Eq)]
@@ -382,17 +406,7 @@ fn parse_measurement_block(body: &[A2lToken<'_>], model: &A2lModel) -> Option<Me
         } else if (kw.eq_ignore_ascii_case("MATRIX_DIM") || kw.eq_ignore_ascii_case("ARRAY_SIZE"))
             && idx + 1 < body.len()
         {
-            idx += 1;
-            while idx < body.len() {
-                if let Some(dim) = parse_u64_literal(body[idx].as_str()) {
-                    if dim > 0 {
-                        matrix_dim.push(dim as usize);
-                    }
-                    idx += 1;
-                } else {
-                    break;
-                }
-            }
+            idx = consume_matrix_dims(body, idx + 1, &mut matrix_dim);
         } else if (kw.eq_ignore_ascii_case("EVENT")
             || kw.eq_ignore_ascii_case("DEFAULT_EVENT_LIST")
             || kw.eq_ignore_ascii_case("FIXED_EVENT_LIST"))
@@ -465,17 +479,7 @@ fn parse_characteristic_block(body: &[A2lToken<'_>], model: &A2lModel) -> Option
         } else if (kw.eq_ignore_ascii_case("MATRIX_DIM") || kw.eq_ignore_ascii_case("NUMBER"))
             && idx + 1 < body.len()
         {
-            idx += 1;
-            while idx < body.len() {
-                if let Some(dim) = parse_u64_literal(body[idx].as_str()) {
-                    if dim > 0 {
-                        matrix_dim.push(dim as usize);
-                    }
-                    idx += 1;
-                } else {
-                    break;
-                }
-            }
+            idx = consume_matrix_dims(body, idx + 1, &mut matrix_dim);
         } else {
             idx += 1;
         }
@@ -524,17 +528,7 @@ fn parse_typedef_measurement_block(
             unit = body[idx + 1].as_str().to_string();
             idx += 2;
         } else if kw.eq_ignore_ascii_case("MATRIX_DIM") && idx + 1 < body.len() {
-            idx += 1;
-            while idx < body.len() {
-                if let Some(dim) = parse_u64_literal(body[idx].as_str()) {
-                    if dim > 0 {
-                        matrix_dim.push(dim as usize);
-                    }
-                    idx += 1;
-                } else {
-                    break;
-                }
-            }
+            idx = consume_matrix_dims(body, idx + 1, &mut matrix_dim);
         } else {
             idx += 1;
         }
@@ -590,17 +584,7 @@ fn parse_typedef_characteristic_block(
         } else if (kw.eq_ignore_ascii_case("MATRIX_DIM") || kw.eq_ignore_ascii_case("NUMBER"))
             && idx + 1 < body.len()
         {
-            idx += 1;
-            while idx < body.len() {
-                if let Some(dim) = parse_u64_literal(body[idx].as_str()) {
-                    if dim > 0 {
-                        matrix_dim.push(dim as usize);
-                    }
-                    idx += 1;
-                } else {
-                    break;
-                }
-            }
+            idx = consume_matrix_dims(body, idx + 1, &mut matrix_dim);
         } else {
             idx += 1;
         }
@@ -649,17 +633,7 @@ fn parse_typedef_structure_block(body: &[A2lToken<'_>]) -> Option<TypedefStructu
                     let mut k = 3;
                     while k < comp_body.len() {
                         if comp_body[k].as_str().eq_ignore_ascii_case("MATRIX_DIM") {
-                            k += 1;
-                            while k < comp_body.len() {
-                                if let Some(d) = parse_u64_literal(comp_body[k].as_str()) {
-                                    if d > 0 {
-                                        matrix_dim.push(d as usize);
-                                    }
-                                    k += 1;
-                                } else {
-                                    break;
-                                }
-                            }
+                            k = consume_matrix_dims(comp_body, k + 1, &mut matrix_dim);
                         } else {
                             k += 1;
                         }
@@ -707,17 +681,7 @@ fn parse_instance_block(body: &[A2lToken<'_>]) -> Option<Instance> {
             address_extension = parse_u64_literal(body[idx + 1].as_str()).unwrap_or(0) as u8;
             idx += 2;
         } else if kw.eq_ignore_ascii_case("MATRIX_DIM") && idx + 1 < body.len() {
-            idx += 1;
-            while idx < body.len() {
-                if let Some(dim) = parse_u64_literal(body[idx].as_str()) {
-                    if dim > 0 {
-                        matrix_dim.push(dim as usize);
-                    }
-                    idx += 1;
-                } else {
-                    break;
-                }
-            }
+            idx = consume_matrix_dims(body, idx + 1, &mut matrix_dim);
         } else if (kw.eq_ignore_ascii_case("EVENT")
             || kw.eq_ignore_ascii_case("DEFAULT_EVENT_LIST")
             || kw.eq_ignore_ascii_case("FIXED_EVENT_LIST"))

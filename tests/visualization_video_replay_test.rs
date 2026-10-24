@@ -4,6 +4,8 @@
 //! `SdfReplayPlayer` multi-part `.sdf` playback & seeking, `TimePlot`, `Numerical`,
 //! and `XcpInfo` tabs.
 
+mod common;
+
 use chrono::{TimeZone, Utc};
 use open_xcp_client::a2l::parser::parse_a2l;
 use open_xcp_client::app_state::{
@@ -15,8 +17,8 @@ use open_xcp_client::config_store::{
 };
 use open_xcp_client::mock_server::sample_adas_a2l::sample_adas_a2l_text;
 use open_xcp_client::recording::{
-    build_ffmpeg_args, extract_polygons_for_layer, extract_xy_points_for_layer,
-    render_plane_plot_rgb24, Mp4VideoRecorder, PlaneViewport, SdfSessionRecorder, MP4_FTYP_MAGIC,
+    extract_polygons_for_layer, extract_xy_points_for_layer, render_plane_plot_rgb24,
+    Mp4VideoRecorder, PlaneViewport, SdfSessionRecorder, MP4_FTYP_MAGIC,
 };
 use open_xcp_client::replay::SdfReplayPlayer;
 use open_xcp_client::ui::axis_ticks::{grid_steps, is_major, nice_step, tick_text, ticks};
@@ -402,12 +404,6 @@ fn test_plane_viewport_transforms_and_offscreen_mp4_recording_with_splitting() {
     let ff_completed = vid_ff.finish().unwrap();
     assert_eq!(ff_completed.len(), 2);
     assert_eq!(vid_ff.completed_files().len(), 2);
-
-    let args_x264 = build_ffmpeg_args(&dir.path().join("out.mp4"), 1280, 720, 15, "libx264");
-    assert!(args_x264.contains(&"libx264".to_string()));
-    assert!(args_x264.contains(&"zerolatency".to_string()));
-    let args_nvenc = build_ffmpeg_args(&dir.path().join("out.mp4"), 1280, 720, 15, "h264_nvenc");
-    assert!(args_nvenc.contains(&"h264_nvenc".to_string()));
 }
 
 #[tokio::test]
@@ -726,7 +722,8 @@ async fn test_multi_part_sdf_replay_player_and_all_5_tabs_and_worker_video_split
         &trail_map,
         sample0,
         &evt_tx,
-    );
+    )
+    .expect("direct record must succeed");
     let emitted: Vec<WorkerEvent> = evt_rx.try_iter().collect();
     assert!(emitted
         .iter()
@@ -763,7 +760,8 @@ async fn test_multi_part_sdf_replay_player_and_all_5_tabs_and_worker_video_split
                 values: vals,
             },
             &evt_tx,
-        );
+        )
+        .expect("direct record must succeed");
     }
     let emitted_sdf_split: Vec<WorkerEvent> = evt_rx.try_iter().collect();
     assert!(emitted_sdf_split
@@ -782,19 +780,23 @@ async fn test_multi_part_sdf_replay_player_and_all_5_tabs_and_worker_video_split
     app.controller.is_recording = false;
     app.controller.request_connect();
 
-    let wait = std::time::Instant::now();
-    while !app.controller.connected && wait.elapsed() < Duration::from_secs(2) {
-        app.controller.poll_worker_events();
-        tokio::time::sleep(Duration::from_millis(15)).await;
-    }
-    assert!(app.controller.connected);
+    assert!(
+        common::wait_until_async(&mut app.controller, Duration::from_secs(3), |c| c.connected)
+            .await
+    );
 
-    // Wait briefly so LiveSample events arrive before starting recording
-    tokio::time::sleep(Duration::from_millis(45)).await;
-    app.controller.poll_worker_events();
-    assert!(!app.controller.latest_measurement_values.is_empty());
+    // Live samples must arrive before recording starts.
+    assert!(
+        common::wait_until_async(&mut app.controller, Duration::from_secs(3), |c| {
+            !c.latest_measurement_values.is_empty()
+        })
+        .await
+    );
 
-    // Start recording with a tiny max_size_bytes so both .sdf and .mp4 split in the worker
+    // Start recording with a tiny max_size_bytes so both .sdf and .mp4 split in the worker.
+    // Earlier sections injected fake completed paths; clear them so only real splits count.
+    app.controller.completed_files.clear();
+    app.controller.completed_video_files.clear();
     app.controller.sync_video_scene_to_worker();
     app.controller
         .send_worker_command(open_xcp_client::app_state::WorkerCommand::StartRecording {
@@ -802,18 +804,67 @@ async fn test_multi_part_sdf_replay_player_and_all_5_tabs_and_worker_video_split
             prefix: "SyncSplit".to_string(),
             max_size_bytes: 20_000,
         });
-    tokio::time::sleep(Duration::from_millis(160)).await;
-    app.controller.poll_worker_events();
+    assert!(
+        common::wait_until_async(&mut app.controller, Duration::from_secs(3), |c| c
+            .is_recording)
+        .await,
+        "status: {}",
+        app.controller.status_message
+    );
+    // Both the .sdf and the .mp4 must have rotated at least once (the lockstep split).
+    assert!(
+        common::wait_until_async(&mut app.controller, Duration::from_secs(5), |c| {
+            !c.completed_files.is_empty() && !c.completed_video_files.is_empty()
+        })
+        .await,
+        "status: {}",
+        app.controller.status_message
+    );
     app.controller.toggle_recording(); // Stop recording
-    tokio::time::sleep(Duration::from_millis(50)).await;
-    app.controller.poll_worker_events();
+    assert!(
+        common::wait_until_async(&mut app.controller, Duration::from_secs(3), |c| !c
+            .is_recording)
+        .await
+    );
     assert!(!app.controller.completed_files.is_empty());
     assert!(!app.controller.completed_video_files.is_empty());
+    assert!(
+        app.controller.completed_files.iter().all(|p| p.exists()),
+        "completed_files: {:?}\nstatus: {}",
+        app.controller.completed_files,
+        app.controller.status_message
+    );
+    assert!(app
+        .controller
+        .completed_video_files
+        .iter()
+        .all(|p| p.exists()));
 
-    // Start recording again and disconnect while recording is active so Disconnect finalizes both .sdf and .mp4
+    // Start recording again and disconnect while recording is active: Disconnect must finalize
+    // both the .sdf and the .mp4 and report them.
+    // RecordingStopped replaces the completed lists, so compare the last paths, not the lengths.
+    let sdf_before = app.controller.completed_files.last().cloned();
+    let mp4_before = app.controller.completed_video_files.last().cloned();
+    app.controller.log_prefix_input = "DisconnectSplit".to_string();
     app.controller.toggle_recording();
-    tokio::time::sleep(Duration::from_millis(40)).await;
+    assert!(
+        common::wait_until_async(&mut app.controller, Duration::from_secs(3), |c| {
+            c.is_recording && c.total_samples_recorded >= 2
+        })
+        .await
+    );
     app.controller.request_disconnect();
-    tokio::time::sleep(Duration::from_millis(40)).await;
-    app.controller.poll_worker_events();
+    assert!(
+        common::wait_until_async(&mut app.controller, Duration::from_secs(3), |c| !c
+            .connected)
+        .await
+    );
+    assert!(!app.controller.is_recording);
+    assert_ne!(app.controller.completed_files.last(), sdf_before.as_ref());
+    assert_ne!(
+        app.controller.completed_video_files.last(),
+        mp4_before.as_ref()
+    );
+    let last_mp4 = app.controller.completed_video_files.last().unwrap();
+    assert!(std::fs::metadata(last_mp4).unwrap().len() > 0);
 }

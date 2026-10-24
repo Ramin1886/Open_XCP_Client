@@ -15,8 +15,22 @@ pub const MAX_ODT_ENTRIES: usize = 255;
 
 /// Maximum number of ODTs in a single DAQ list.
 ///
-/// `ALLOC_ODT` and `SET_DAQ_PTR` carry the ODT number in one byte.
-pub const MAX_ODTS_PER_DAQ_LIST: usize = 255;
+/// `ALLOC_ODT` and `SET_DAQ_PTR` carry the ODT number in one byte, and with absolute ODT
+/// numbering that byte is also the DTO packet identifier, where `0xFC..=0xFF` are reserved for
+/// SERV / EV / ERR / RES packets. Usable ODT numbers are therefore `0..=251`.
+pub const MAX_ODTS_PER_DAQ_LIST: usize = 252;
+
+/// The DTO identification field carries the DAQ list number in one byte, so at most 256 lists
+/// can ever be demultiplexed; further event channels are reported as dropped, never planned.
+pub const MAX_DAQ_LISTS: usize = 256;
+
+/// Largest slice of one measurement placed into a single ODT entry. Must stay <= 255 because the
+/// entry size travels as a `u8` in `WRITE_DAQ`; 128 keeps large arrays spread evenly across ODTs.
+pub const MAX_ODT_ENTRY_CHUNK_BYTES: usize = 128;
+
+/// Bytes subtracted from the target's `MAX_DTO` before planning: the 2-byte XCP-on-Ethernet
+/// length/counter header plus a 4-byte safety margin for transport-layer padding.
+pub const DTO_HEADER_RESERVE_BYTES: usize = 6;
 
 /// Decoded physical value of a measurement (either a scalar or a flattened N-D array).
 #[derive(Debug, Clone, PartialEq)]
@@ -205,6 +219,8 @@ pub struct DaqPlanner {
     pending_discards: Vec<CycleDiscard>,
     /// DTOs naming a DAQ list or ODT that was never allocated.
     unplanned_dto: u64,
+    /// Measurements on event channels beyond [`MAX_DAQ_LISTS`]; never acquired.
+    unlisted_dropped: Vec<usize>,
 }
 
 /// Returns the measurement-data budget of one ODT, reserving 4 bytes for the DAQ timestamp
@@ -240,7 +256,14 @@ impl DaqPlanner {
         let mut staging_bytes = Vec::new();
         let mut staging_ts = Vec::new();
 
+        let mut unlisted_dropped: Vec<usize> = Vec::new();
         for (daq_idx, (event_channel_id, meas_indices)) in grouped.into_iter().enumerate() {
+            if daq_idx >= MAX_DAQ_LISTS {
+                // No DAQ list number is left for this event channel: report every measurement
+                // on it as not acquired rather than aliasing it onto an existing list.
+                unlisted_dropped.extend(meas_indices);
+                continue;
+            }
             let daq_list_num = daq_idx as u16;
             let (event_name, refresh_rate_ms) = model
                 .events
@@ -269,7 +292,9 @@ impl DaqPlanner {
 
                 while offset < total_bytes {
                     let budget = odt_payload_budget(odts.is_empty(), max_payload);
-                    let chunk = (total_bytes - offset).min(128).min(budget);
+                    let chunk = (total_bytes - offset)
+                        .min(MAX_ODT_ENTRY_CHUNK_BYTES)
+                        .min(budget);
                     let full = !current_entries.is_empty()
                         && (current_bytes + chunk > budget
                             || current_entries.len() >= MAX_ODT_ENTRIES);
@@ -354,6 +379,7 @@ impl DaqPlanner {
             loss_stats,
             pending_discards: Vec::new(),
             unplanned_dto: 0,
+            unlisted_dropped,
         }
     }
 
@@ -437,6 +463,7 @@ impl DaqPlanner {
             .lists
             .iter()
             .flat_map(|l| l.dropped_measurement_indices.iter().copied())
+            .chain(self.unlisted_dropped.iter().copied())
             .collect();
         out.sort_unstable();
         out

@@ -1,0 +1,9 @@
+# SPDX-License-Identifier: GPL-2.0-only
+# Allowed unwrap()/expect() sites in src/. Format: <repo path>|<substring of the line>.
+# Remove a line when the site is fixed; never add one without a reason comment.
+# Parsing fixed address literals cannot fail.
+src/xcp/transport.rs|"0.0.0.0:0".parse().unwrap()
+src/xcp/transport.rs|"[::]:0".parse().unwrap()
+# Thread/runtime creation failure at startup has no meaningful recovery (docs/TODO.md tracks surfacing it).
+src/app_state.rs|.expect("Failed to spawn background XCP worker thread")
+src/app_state.rs|.expect("Failed to create Tokio runtime for XCP worker")

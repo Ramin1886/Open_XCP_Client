@@ -15,7 +15,7 @@ Implemented in [`src/calibration/`](../src/calibration/mod.rs) and [`src/ui/cali
    - Use the search box in the **1. Find Calibration Variable** pane to filter A2L `CHARACTERISTIC` parameters by name, struct hierarchy, or description.
    - Click **`+ Add`** next to any parameter to add it to the **2. Active Calibration Content** pane (and persist it in `./config/settings.json` watch-list).
 2. **Automatic Initial Read**:
-   - Upon adding a parameter (or clicking **`↻ Refresh from Target`**), the client issues an XCP `SHORT_UPLOAD` (or `SET_MTA` + `UPLOAD` for arrays $> 7$ bytes), converts the raw ECU bytes using the parameter's `COMPU_METHOD`, and displays the current target value in the input field.
+   - Upon adding a parameter (or clicking **`↻ Refresh from Target`**), the client issues an XCP `SHORT_UPLOAD` (or `SET_MTA` + `UPLOAD` when the value is longer than `MAX_CTO - 1` bytes), converts the raw ECU bytes using the parameter's `COMPU_METHOD`, and displays the current target value in the input field.
 3. **Modify & Press Enter to Send**:
    - Edit the value in the input field (or select an enum option from the dropdown for `TAB_VERB` parameters).
    - Press **`Enter`** (or click **`↵ Enter`**) to validate and transmit the new value to the target.

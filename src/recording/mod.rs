@@ -14,6 +14,6 @@ pub use sdf_writer::{
 };
 pub use size_splitter::SizeSplitter;
 pub use video_recorder::{
-    build_ffmpeg_args, extract_polygons_for_layer, extract_xy_points_for_layer,
-    render_plane_plot_rgb24, Mp4VideoRecorder, PlaneViewport, MP4_FTYP_MAGIC,
+    extract_polygons_for_layer, extract_xy_points_for_layer, render_plane_plot_rgb24,
+    Mp4VideoRecorder, PlaneViewport, MP4_FTYP_MAGIC,
 };

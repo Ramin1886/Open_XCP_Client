@@ -30,7 +30,7 @@ jobs:
         uses: Swatinem/rust-cache@v2
 
       - name: Build release binary
-        run: cargo build --release
+        run: cargo build --release --locked
 
       - name: Upload Linux binary artifact
         uses: actions/upload-artifact@v4
@@ -52,7 +52,7 @@ jobs:
         uses: Swatinem/rust-cache@v2
 
       - name: Build release executable
-        run: cargo build --release
+        run: cargo build --release --locked
 
       - name: Upload Windows .exe artifact
         uses: actions/upload-artifact@v4

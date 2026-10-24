@@ -1,0 +1,9 @@
+{
+  "mcpServers": {
+    "xcp_devtool": {
+      "command": "bash",
+      "args": ["tools/xcp_devtool/launch.sh"],
+      "cwd": "/home/ramin1886/0_Repos/APF_XCP_Client"
+    }
+  }
+}

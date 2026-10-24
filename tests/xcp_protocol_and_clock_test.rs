@@ -115,15 +115,26 @@ fn test_target_clock_sync_native_utc_and_monotonic_rollover() {
     assert!(hs > 1_700_000_000.0);
     assert!(hns > 1_700_000_000_000_000_000);
 
-    // 4. 4-byte GET_DAQ_CLOCK response and None DTO timestamp fallback
+    // 4. Replies shorter than the 7-byte 32-bit form carry no timestamp (bytes 0..3 are
+    //    reserved / trigger info) and must leave the sync unanchored; a None DTO timestamp
+    //    then falls back to the host clock.
     let mut short_sync = TargetClockSync::default();
     short_sync.update_from_get_daq_clock_response(&[1, 2], 1_792_716_000_000_000_000);
     assert!(!short_sync.is_synchronized());
     short_sync
         .update_from_get_daq_clock_response(&1000u32.to_le_bytes(), 1_792_716_000_000_000_000);
-    assert!(short_sync.is_synchronized());
+    assert!(
+        !short_sync.is_synchronized(),
+        "a 4-byte reply has no timestamp field and must not anchor the clock"
+    );
+    short_sync.update_from_get_daq_clock_response(&[0, 0, 0, 0, 0, 0], 1_792_716_000_000_000_000);
+    assert!(!short_sync.is_synchronized());
     let (none_s, _) = short_sync.resolve_sample_utc(None);
     assert!(none_s > 1_700_000_000.0);
+    let mut payload_7 = vec![0, 0, 0];
+    payload_7.extend_from_slice(&1000u32.to_le_bytes());
+    short_sync.update_from_get_daq_clock_response(&payload_7, 1_792_716_000_000_000_000);
+    assert!(short_sync.is_synchronized());
 }
 
 #[test]

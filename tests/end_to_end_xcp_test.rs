@@ -5,6 +5,8 @@
 //! - Concurrent live calibration reads (`SHORT_UPLOAD`) and writes (`SHORT_DOWNLOAD` / `DOWNLOAD`)
 //!   with readback verification while DAQ recording is active.
 
+mod common;
+
 use chrono::Utc;
 use open_xcp_client::a2l::parser::parse_a2l;
 use open_xcp_client::app_state::AppController;
@@ -14,8 +16,9 @@ use open_xcp_client::calibration::{
 use open_xcp_client::config_store::{ConfigStore, TransportProtocol};
 use open_xcp_client::mock_server::MockXcpServer;
 use open_xcp_client::recording::{SdfFileReader, SdfSessionRecorder};
-use open_xcp_client::xcp::client::XcpClient;
+use open_xcp_client::xcp::client::{A2lSource, XcpClient, MAX_UPLOAD_BYTES};
 use open_xcp_client::xcp::daq_planner::DaqPlanner;
+use open_xcp_client::xcp::daq_planner::DTO_HEADER_RESERVE_BYTES;
 use std::time::Duration;
 use tempfile::tempdir;
 
@@ -32,16 +35,30 @@ async fn run_full_protocol_flow(protocol: TransportProtocol) {
             .expect("Should connect to mock XCPlite 2.2.2 server");
 
     // 1. Fetch A2L dynamically from target via XCP GET_ID + UPLOAD
-    let a2l_text = client
+    let (a2l_text, a2l_source) = client
         .fetch_a2l(None)
         .await
         .expect("Should upload A2L from target");
+    assert_eq!(a2l_source, A2lSource::TargetUpload);
     let model = parse_a2l(&a2l_text).expect("Uploaded A2L should parse cleanly");
+
+    // A length announced by the target must never size an allocation unchecked.
+    let too_big = client
+        .upload_from_current_mta(MAX_UPLOAD_BYTES + 1)
+        .await
+        .expect_err("an upload above the safety limit must be refused");
+    assert!(
+        too_big.to_string().contains("safety limit"),
+        "unexpected error: {too_big}"
+    );
     assert!(model.measurements.len() >= 10);
     assert!(model.characteristics.len() >= 6);
 
     // 2. Start DAQ streaming for all measurements grouped by Event refresh rate
-    let mut planner = DaqPlanner::from_a2l(&model, client.max_dto().saturating_sub(6));
+    let mut planner = DaqPlanner::from_a2l(
+        &model,
+        client.max_dto().saturating_sub(DTO_HEADER_RESERVE_BYTES),
+    );
     client
         .configure_and_start_daq(&planner)
         .await
@@ -148,13 +165,8 @@ fn test_app_controller_background_worker_lifecycle() {
     controller.log_prefix_input = "Measurement".to_string();
 
     controller.request_connect();
-    let start = std::time::Instant::now();
-    while !controller.connected && start.elapsed() < Duration::from_secs(3) {
-        controller.poll_worker_events();
-        std::thread::sleep(Duration::from_millis(15));
-    }
     assert!(
-        controller.connected,
+        common::wait_until(&mut controller, Duration::from_secs(3), |c| c.connected),
         "Controller should connect to mock server"
     );
     assert!(controller.a2l_model.is_some());
@@ -163,13 +175,12 @@ fn test_app_controller_background_worker_lifecycle() {
     controller.add_calibration_variable("Cal.Controller.kp_gain");
     controller.toggle_recording();
 
-    let rec_wait = std::time::Instant::now();
-    while controller.total_samples_recorded < 3 && rec_wait.elapsed() < Duration::from_secs(3) {
-        controller.poll_worker_events();
-        std::thread::sleep(Duration::from_millis(15));
-    }
+    assert!(common::wait_until(
+        &mut controller,
+        Duration::from_secs(3),
+        |c| c.total_samples_recorded >= 3
+    ));
     assert!(controller.is_recording);
-    assert!(controller.total_samples_recorded >= 3);
 
     // Modify calibration variable while recording is active
     controller
@@ -181,19 +192,111 @@ fn test_app_controller_background_worker_lifecycle() {
 
     // Stop recording and disconnect
     controller.toggle_recording();
-    let stop_wait = std::time::Instant::now();
-    while controller.is_recording && stop_wait.elapsed() < Duration::from_secs(2) {
-        controller.poll_worker_events();
-        std::thread::sleep(Duration::from_millis(15));
-    }
-    assert!(!controller.is_recording);
+    assert!(common::wait_until(
+        &mut controller,
+        Duration::from_secs(2),
+        |c| !c.is_recording
+    ));
     assert!(!controller.completed_files.is_empty());
 
     controller.request_disconnect();
-    let disc_wait = std::time::Instant::now();
-    while controller.connected && disc_wait.elapsed() < Duration::from_secs(2) {
-        controller.poll_worker_events();
-        std::thread::sleep(Duration::from_millis(15));
+    assert!(common::wait_until(
+        &mut controller,
+        Duration::from_secs(2),
+        |c| !c.connected
+    ));
+}
+
+#[test]
+fn test_dropping_the_controller_while_recording_finalizes_the_part_file() {
+    let dir = tempdir().unwrap();
+    let store = ConfigStore::new(dir.path().join("settings.json"));
+    let rec_dir = dir.path().join("rec");
+    {
+        let mut controller = AppController::new(store);
+        controller.settings.ui.enable_mock_server = true;
+        controller.settings.recording.record_video_mp4 = false;
+        controller.log_folder_input = rec_dir.display().to_string();
+        controller.log_prefix_input = "DropTest".to_string();
+        controller.request_connect();
+        assert!(common::wait_until(
+            &mut controller,
+            Duration::from_secs(3),
+            |c| c.connected
+        ));
+        controller.toggle_recording();
+        assert!(common::wait_until(
+            &mut controller,
+            Duration::from_secs(3),
+            |c| c.total_samples_recorded >= 5
+        ));
+        assert!(controller.is_recording);
+        // Dropped mid-recording, exactly like closing the window: Drop must join the worker.
     }
-    assert!(!controller.connected);
+    let parts: Vec<_> = std::fs::read_dir(&rec_dir)
+        .expect("recording folder exists")
+        .map(|e| e.unwrap().path())
+        .filter(|p| p.extension().is_some_and(|e| e == "sdf"))
+        .collect();
+    assert_eq!(
+        parts.len(),
+        1,
+        "exactly one finalized part expected: {parts:?}"
+    );
+    let reader = SdfFileReader::open(&parts[0]).expect("part must be complete and readable");
+    assert!(reader.metadata.datasets.len() > 2);
+    // total_samples_recorded counts both event channels, so check their time datasets together.
+    let on_disk: usize = [
+        "/Events/Event_10ms/time_utc_s",
+        "/Events/Event_50ms/time_utc_s",
+    ]
+    .iter()
+    .map(|p| reader.read_f64_dataset(p).map_or(0, |t| t.len()))
+    .sum();
+    assert!(
+        on_disk >= 5,
+        "samples recorded before drop must be on disk, found {on_disk}"
+    );
+}
+
+#[tokio::test]
+async fn test_local_a2l_is_a_fallback_used_only_when_the_upload_fails() {
+    // A target that answers GET_ID with a zero-length A2L: the upload fails cleanly.
+    let server = MockXcpServer::start_with_options(0, false).await.unwrap();
+    let (client, _clock, _daq_rx) = XcpClient::connect(
+        server.udp_addr,
+        TransportProtocol::Udp,
+        Duration::from_secs(2),
+        true,
+    )
+    .await
+    .unwrap();
+
+    let no_fallback = client.fetch_a2l(None).await.expect_err("no A2L anywhere");
+    assert!(
+        no_fallback.to_string().contains("zero-length"),
+        "{no_fallback}"
+    );
+
+    let dir = tempdir().unwrap();
+    let local = dir.path().join("fallback.a2l");
+    std::fs::write(&local, sample_a2l()).unwrap();
+    let (text, source) = client
+        .fetch_a2l(Some(local.to_str().unwrap()))
+        .await
+        .expect("local file must be used when the upload fails");
+    assert_eq!(source, A2lSource::LocalFile(local.clone()));
+    assert!(text.contains("OpenXcpAdasProject"));
+
+    let missing = client
+        .fetch_a2l(Some("/nonexistent/fallback.a2l"))
+        .await
+        .expect_err("unreadable fallback cannot rescue a failed upload");
+    assert!(missing.to_string().contains("unreadable"), "{missing}");
+    client.disconnect().await.unwrap();
+    server.stop();
+}
+
+fn sample_a2l() -> &'static str {
+    open_xcp_client::mock_server::sample_adas_a2l::sample_adas_a2l_text()
 }

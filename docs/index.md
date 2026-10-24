@@ -16,9 +16,9 @@ Welcome to the official technical documentation for **Open_XCP_Client**. Every m
    - Resolving `TYPEDEF_STRUCTURE`, `STRUCTURE_COMPONENT`, `TYPEDEF_MEASUREMENT`, `TYPEDEF_CHARACTERISTIC`, and `INSTANCE`.
    - Normalizing dot-separated and array-indexed `MEASUREMENT` names into hierarchical trees.
    - `COMPU_METHOD` conversions (`IDENTICAL`, `LINEAR`, `RAT_FUNC`, `TAB_VERB`).
-4. [**HDF5-Based `.sdf` & `.mp4` Video Recording with Configurable Size Splitting**](./sdf_file_format.md)
-   - HDF5 Superblock v2 / Object Header v2 layout (`/Events` and `/Measurements` hierarchies).
-   - Synchronized `.sdf` and H.264 `.mp4` 2D plot video recording (`PART001.sdf` + `PART001.mp4`).
+4. [**`.sdf` Container & `.mp4` Frame-Stream Recording with Configurable Size Splitting**](./sdf_file_format.md)
+   - HDF5 signature and superblock plus an embedded JSON index (`/Events` and `/Measurements` dataset names); not readable by generic HDF5 tools yet.
+   - Synchronized `.sdf` and `.mp4`-named RLE frame-stream recording (`PART001.sdf` + `PART001.mp4`); the video is not H.264.
    - Configurable split size (`max_logfile_size_mb`, default `500 MB` in `settings.json`).
 5. [**Calibration Guide & Type-Safe Validation**](./calibration_guide.md)
    - Finding and adding `CHARACTERISTIC` parameters to the active Calibration Content list.
@@ -35,6 +35,11 @@ Welcome to the official technical documentation for **Open_XCP_Client**. Every m
 8. [**CI/CD Pipelines, Release Packaging & Test Coverage**](./ci_cd_and_packaging.md)
    - GitHub Actions workflows (`ci.yml` and `release.yml`).
    - Running tests and verifying $\ge 95\%$ source code coverage.
+9. [**Honest Assessment & Prioritised Backlog (`TODO.md`)**](./TODO.md)
+   - Severity-ranked (1–10) findings with file anchors, definition of fixed, and recommended order.
+   - Known limitations of the `.sdf` and `.mp4` outputs, protocol negotiation gaps, and process debt.
+10. [**Agent Development Guide (`AGENTS.md`)**](../AGENTS.md)
+   - Stable guidelines, commands, invariants and definition of done for AI-assisted changes; developer tool `tools/xcp_devtool`.
 
 ---
 
@@ -47,7 +52,7 @@ Welcome to the official technical documentation for **Open_XCP_Client**. Every m
 - [`src/app_state.rs`](../src/app_state.rs) — UI controller & background worker orchestration
 - [`src/a2l/`](../src/a2l/mod.rs) — A2L lexer, parser, structure resolver, and conversion rules
 - [`src/xcp/`](../src/xcp/mod.rs) — XCP packet framing, UDP/TCP transport, DAQ planner, and clock sync
-- [`src/recording/`](../src/recording/mod.rs) — `.sdf` (HDF5 v2) writer/reader, `.mp4` video recorder, file namer, and size splitter
+- [`src/recording/`](../src/recording/mod.rs) — `.sdf` container writer/reader, `.mp4`-named frame-stream recorder, file namer, and size splitter
 - [`src/replay/`](../src/replay/mod.rs) — Multi-part `.sdf` recording replay engine
 - [`src/calibration/`](../src/calibration/mod.rs) — Calibration validator and active watch-list manager
 - [`src/ui/`](../src/ui/mod.rs) — `egui`/`eframe` user interface components (5 tabs + top bar + settings + plot profile selector)

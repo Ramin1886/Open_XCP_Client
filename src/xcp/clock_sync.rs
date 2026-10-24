@@ -76,14 +76,9 @@ impl TargetClockSync {
                 res_payload[5],
                 res_payload[6],
             ]) as u64
-        } else if res_payload.len() >= 4 {
-            u32::from_le_bytes([
-                res_payload[0],
-                res_payload[1],
-                res_payload[2],
-                res_payload[3],
-            ]) as u64
         } else {
+            // Shorter replies carry only the reserved / trigger-info bytes and no timestamp
+            // (bytes 0..3 are not clock data); stay unsynchronized rather than anchor on garbage.
             return;
         };
 

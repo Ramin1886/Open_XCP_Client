@@ -60,16 +60,18 @@ flowchart LR
     XCP <== "XCP on Ethernet (UDP/TCP)" ==> Trans
 ```
 
+> **Known limitations (honest status, see [`docs/TODO.md`](./docs/TODO.md)):** the `.mp4` files are a proprietary RLE-compressed RGB frame stream in an MP4-like container and are **not playable by standard players** (T-01); the `.sdf` files carry an HDF5 signature but are indexed by an embedded JSON tail and are **not readable by h5py/HDFView** (T-02); a recording part is held in memory until it is split or stopped (T-03). The project's own replay engine reads both formats.
+
 `Open_XCP_Client` decouples network acquisition and disk I/O from the user interface thread:
 1. **UI Thread (`eframe`/`egui`)**: Renders the top navigation bar (`Live` / `Replay` switcher, recording/replay controls, **`⚙ Settings`** button) and the 5 interactive tabs (**2D Live Plot**, **Numerical**, **Time Plot**, **Calibration**, **XCP Info**) with minimal CPU and memory overhead.
-2. **Async XCP & Recording Worker (`tokio`)**: Manages socket communication, dynamic A2L upload, immediate live DAQ DTO packet demultiplexing, UTC timestamp correlation, synchronized `.sdf` + `.mp4` (H.264) recording with lockstep file-size splitting, and concurrent calibration `SHORT_DOWNLOAD` / `DOWNLOAD` requests.
+2. **Async XCP & Recording Worker (`tokio`)**: Manages socket communication, dynamic A2L upload, immediate live DAQ DTO packet demultiplexing, UTC timestamp correlation, synchronized `.sdf` + `.mp4` (RLE frame stream, see Known limitations) recording with lockstep file-size splitting, and concurrent calibration `SHORT_DOWNLOAD` / `DOWNLOAD` requests.
 
 ---
 
 ## Core Capabilities
 
 ### 1. Dynamic Target A2L Upload & Immediate Live DAQ Streaming
-- Automatically queries the running `xcplite` 2.2.2 server using `GET_ID (IDT_ASAM_UPLOAD = 4)` followed by chunked `UPLOAD` transfers to retrieve the target's A2L specification directly over Ethernet (with an optional local `.a2l` file fallback).
+- Automatically queries the running `xcplite` 2.2.2 server using `GET_ID (IDT_ASAM_UPLOAD = 4)` followed by chunked `UPLOAD` transfers to retrieve the target's A2L specification directly over Ethernet (with an optional local `.a2l` file that is read only when the upload fails or is empty; the connect status says which source was used).
 - Reconstructs complex C/C++ data structures from both ASAM MCD-2 MC v1.7 `TYPEDEF_STRUCTURE` / `STRUCTURE_COMPONENT` / `INSTANCE` declarations and hierarchical symbol paths (e.g., `Perception.RadarFront.targets[0].distance_m`), preserving all nested attributes and multidimensional (`MATRIX_DIM`) arrays.
 - Starts live DAQ streaming immediately on connect so all visualization and numerical tabs update in real time before recording to disk.
 
@@ -78,13 +80,13 @@ flowchart LR
 - Configurable **Ego Vehicle Footprint** in **`⚙ Settings`**: parameterized by **Ego Length (`m`)** (default `4.85 m`), **Ego Width (`m`)** (default `1.90 m`), and **Rear-Axle to Center (`m`)** (default `1.425 m`).
 - Interactive **`(X, Y)` Signal Pair Builder** with instant search filtering: pair any `X` and `Y` A2L signals regardless of whether `X` and `Y` are scalars or vectors (`MATRIX_DIM`) — supporting scalar-scalar, vector-vector, scalar-vector broadcast, optional valid-count truncation, and 4-corner polygon sets (`P0..P3`) across `Scatter`, `Connected Line`, `History Trail`, and `4-Corner Polygon` styles.
 
-### 3. Synchronized `.sdf` + `.mp4` (H.264) Recording & Lockstep Size Splitting
+### 3. Synchronized `.sdf` + `.mp4` Recording & Lockstep Size Splitting
 - Stores recordings by default in `./logfile/` using matched part filenames:
   ```text
   <Prefix>_<YYYY-MM-DD_HH-MM-SSZ>_PART001.sdf
   <Prefix>_<YYYY-MM-DD_HH-MM-SSZ>_PART001.mp4
   ```
-- Records 100% of incoming DAQ event samples at their native event rates into hierarchical HDF5 v2 `.sdf` files while simultaneously recording the 2D XY Plot offscreen as an H.264 `.mp4` video at a configurable frame rate (`1..30 FPS`, default `10 FPS`).
+- Records every complete DAQ cycle at its native event rate into `.sdf` part files (an HDF5-signature container with an embedded JSON index, readable by this client's replay engine; not by generic HDF5 tools yet, T-02) while simultaneously recording the 2D XY Plot offscreen as an `.mp4`-named RLE frame stream at a configurable frame rate (`1..30 FPS`, default `10 FPS`). The stream is not H.264 and standard players cannot open it (T-01).
 - Whenever either the `.sdf` logfile or the `.mp4` video reaches the configured split threshold (**default `500 MB`** in `⚙ Settings`), both rotate in lockstep to `PART002.sdf` and `PART002.mp4` while preserving the original recording-start UTC timestamp.
 
 ### 4. Multi-Part `.sdf` Replay Mode
@@ -102,12 +104,12 @@ flowchart LR
 ## Getting Started
 
 ### Prebuilt Executables
-Self-contained executables for Windows (`open_xcp_client.exe`) and Linux (`open_xcp_client`) are compiled automatically by the [Build & Release Binaries workflow](./.github/workflows/release.yml) and require no external runtime dependencies.
+Executables for Windows (`open_xcp_client.exe`) and Linux (`open_xcp_client`) are compiled automatically by the [Build & Release Binaries workflow](./.github/workflows/release.yml). No ffmpeg or HDF5 library is required; the Linux binary links the system OpenGL / X11 / Wayland libraries dynamically. Only the Linux build is exercised by CI (T-19).
 
 ### Building from Source
 
 #### Prerequisites
-- Rust stable toolchain (`1.80+`)
+- Rust stable toolchain (`1.87+`, `rust-version` in `Cargo.toml`)
 - On Linux (Ubuntu/Debian), install standard X11/Wayland/OpenGL development headers:
   ```bash
   sudo apt-get update
@@ -125,7 +127,7 @@ The optimized executable is produced at `target/release/open_xcp_client` (or `ta
 # Launch the desktop GUI (default)
 ./target/release/open_xcp_client
 
-# Run a headless self-check of configuration, A2L parsing, and SDF recording
+# Render one UI frame headlessly against the current settings (no A2L parsing or recording)
 ./target/release/open_xcp_client --headless-self-check
 
 # Print version information
@@ -164,14 +166,14 @@ Runtime settings are stored in `./config/settings.json` (seeded from [`./config/
 | `connection.target_port` | `u16` | `5555` | UDP/TCP port of the `xcplite` server |
 | `connection.transport` | `"Udp"` \| `"Tcp"` | `"Udp"` | XCP-on-Ethernet transport layer protocol |
 | `connection.connect_timeout_ms` | `u64` | `2000` | Command response timeout in milliseconds |
-| `connection.local_a2l_fallback_path` | `string` | `""` | Optional local `.a2l` path if target upload is disabled |
+| `connection.local_a2l_fallback_path` | `string` | `""` | Optional local `.a2l` path, read only when the target upload fails or is empty |
 | `recording.default_log_folder` | `string` | `"./logfile"` | Output directory for recorded `.sdf` and `.mp4` files |
 | `recording.default_file_prefix` | `string` | `"Measurement"` | Prefix used for `<Prefix>_<UTC>_PARTxxx.{sdf,mp4}` |
 | `recording.max_logfile_size_mb` | `u64` | `500` | Maximum size per `.sdf` or `.mp4` part file in megabytes |
 | `recording.prefer_target_utc_clock` | `bool` | `true` | Prefer target real-time UTC clock (`GET_DAQ_CLOCK`) over host clock |
-| `recording.record_video_mp4` | `bool` | `true` | Record offscreen 2D XY plot as `.mp4` alongside `.sdf` |
+| `recording.record_video_mp4` | `bool` | `true` | Record the offscreen 2D XY plot as an `.mp4`-named RLE frame stream alongside `.sdf` (not H.264, T-01) |
 | `recording.video_fps` | `u32` | `10` | Video frame rate in Hz (`1..=30`) |
-| `recording.video_encoder` | `string` | `"libx264"` | H.264 encoder (`"libx264"`, `"h264_nvenc"`, `"h264_qsv"`, `"h264_amf"`, `"native"`) |
+| `recording.video_encoder` | `string` | `"libx264"` | Reserved; stored but **not used** by the current recorder (T-01) |
 | `visualization.ego.length_m` | `f64` | `4.85` | Ego vehicle length in meters |
 | `visualization.ego.width_m` | `f64` | `1.90` | Ego vehicle width in meters |
 | `visualization.ego.rear_axle_to_center_m` | `f64` | `1.425` | Longitudinal offset (`+x`) from rear axle `(0, 0)` to vehicle center (`m`) |
@@ -219,7 +221,7 @@ See the [Plot Profiles guide](./docs/plot_profiles.md) and
 - **Filename Patterns**:
   - `<Prefix>_<YYYY-MM-DD_HH-MM-SSZ>_PART<NNN>.sdf`
   - `<Prefix>_<YYYY-MM-DD_HH-MM-SSZ>_PART<NNN>.mp4`
-- **Internal HDF5 `.sdf` Hierarchy**:
+- **Internal `.sdf` dataset paths** (HDF5-style names resolved through the embedded `SDFIDX02` JSON index; see [`docs/sdf_file_format.md`](./docs/sdf_file_format.md)):
   - `/Events/<EventName>/time_utc_s` — `float64` UTC epoch timestamp vector in seconds (`[N]`)
   - `/Events/<EventName>/time_utc_ns` — `int64` UTC epoch timestamp vector in nanoseconds (`[N]`)
   - `/Measurements/<StructGroup>/<SubStruct>/<Field>` — `float64` physical value dataset (`[N]` for scalars, `[N, D...]` for arrays).
@@ -249,8 +251,8 @@ Each source file in [`./src/`](./src/) is scoped to a single, well-defined respo
 | [`src/xcp/client.rs`](./src/xcp/client.rs) | High-level XCP Master client (connect, A2L upload, DAQ control, concurrent calibration) |
 | [`src/recording/file_namer.rs`](./src/recording/file_namer.rs) | UTC timestamp formatter and sequential `.sdf` / `.mp4` part filename generator |
 | [`src/recording/size_splitter.rs`](./src/recording/size_splitter.rs) | Byte-budget tracker enforcing the configurable `max_logfile_size_mb` split threshold |
-| [`src/recording/sdf_writer.rs`](./src/recording/sdf_writer.rs) | Hierarchical HDF5 v2 `.sdf` file writer, Jenkins `lookup3` checksums, and verifier reader |
-| [`src/recording/video_recorder.rs`](./src/recording/video_recorder.rs) | Offscreen 2D XY plot rasterizer, `(X, Y)` signal pairing, and `.mp4` (H.264 / ISO BMFF) recorder |
+| [`src/recording/sdf_writer.rs`](./src/recording/sdf_writer.rs) | `.sdf` container writer (HDF5 signature + superblock, Jenkins `lookup3` checksums, embedded JSON index) and the matching reader |
+| [`src/recording/video_recorder.rs`](./src/recording/video_recorder.rs) | Offscreen 2D XY plot rasterizer, `(X, Y)` signal pairing, and `.mp4`-named RLE frame-stream writer (not H.264, T-01) |
 | [`src/replay/mod.rs`](./src/replay/mod.rs) | Multi-part `.sdf` recording replay engine with speed scaling and 5-second pre-roll seeking |
 | [`src/calibration/validator.rs`](./src/calibration/validator.rs) | Strict data-type syntax parser, A2L `[LowerLimit, UpperLimit]` checker, and raw byte encoder |
 | [`src/calibration/manager.rs`](./src/calibration/manager.rs) | Calibration Content watch-list state machine and Enter-key submission handler |
@@ -264,6 +266,7 @@ Each source file in [`./src/`](./src/) is scoped to a single, well-defined respo
 | [`src/ui/calibration_tab.rs`](./src/ui/calibration_tab.rs) | Calibration tab UI (parameter finder, active watch-list table, type-aware input fields) |
 | [`src/ui/xcp_info_tab.rs`](./src/ui/xcp_info_tab.rs) | XCP target/A2L metadata and per-event DAQ cycle-time telemetry table |
 | [`src/mock_server/`](./src/mock_server/mod.rs) | Built-in Mock `xcplite` 2.2.2 UDP/TCP server and sample ADAS A2L generator |
+| [`tools/xcp_devtool/`](./tools/xcp_devtool/) | Developer CLI and MCP server: A2L/SDF inspection, DAQ plan dry-run, mock server, target probe, project and invariant checks (see [`AGENTS.md`](./AGENTS.md)) |
 
 ---
 
@@ -275,10 +278,12 @@ Detailed engineering documentation is located in [`./docs/`](./docs/index.md):
 2. [**System Architecture & Performance Optimization**](./docs/architecture.md)
 3. [**XCP on Ethernet Protocol & Vector `xcplite` 2.2.2 Integration**](./docs/xcp_protocol_and_xcplite.md)
 4. [**A2L Parsing & Complex C/C++ Structure Mapping**](./docs/a2l_structure_mapping.md)
-5. [**HDF5-Based `.sdf` & `.mp4` Video Recording with Size Splitting**](./docs/sdf_file_format.md)
+5. [**`.sdf` Container & `.mp4` Frame-Stream Recording with Size Splitting**](./docs/sdf_file_format.md)
 6. [**Calibration Guide & Data-Type Validation**](./docs/calibration_guide.md)
 7. [**UI / UX Operator Manual (5 Tabs, 2D Plot & Replay)**](./docs/ui_ux_manual.md)
-8. [**CI/CD Pipelines, Release Packaging & Test Coverage**](./docs/ci_cd_and_packaging.md)
+8. [**Plot Profiles — Predefined, Reusable Measurement Views**](./docs/plot_profiles.md)
+9. [**CI/CD Pipelines, Release Packaging & Test Coverage**](./docs/ci_cd_and_packaging.md)
+10. [**Honest Assessment & Prioritised Backlog (`TODO.md`)**](./docs/TODO.md)
 
 ---
 
@@ -290,9 +295,15 @@ Run formatting checks, static analysis, and the complete integration test suite:
 # Check formatting
 cargo fmt --all -- --check
 
-# Run Clippy linter with warnings denied
-cargo clippy --all-targets -- -D warnings
+# Run Clippy linter with warnings denied (whole workspace)
+cargo clippy --workspace --all-targets -- -D warnings
 
-# Run all unit, headless UI, video recording, replay, and end-to-end XCP integration tests
-cargo test
+# Run all integration tests (product crate) and the devtool tests
+cargo test --workspace
+
+# Repository invariants and a DAQ plan dry-run on the built-in sample A2L
+cargo run -q -p xcp_devtool -- invariants-check
+cargo run -q -p xcp_devtool -- daq-plan-dryrun --builtin adas_sample --max-dto 256
 ```
+
+Agent-assisted development is described in [`AGENTS.md`](./AGENTS.md).

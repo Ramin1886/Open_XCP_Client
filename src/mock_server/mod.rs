@@ -54,10 +54,14 @@ struct MockSlaveState {
 }
 
 impl MockSlaveState {
-    fn new() -> Self {
+    fn new(serve_a2l: bool) -> Self {
         let mut s = Self {
             memory: BTreeMap::new(),
-            a2l_bytes: sample_adas_a2l_text().as_bytes().to_vec(),
+            a2l_bytes: if serve_a2l {
+                sample_adas_a2l_text().as_bytes().to_vec()
+            } else {
+                Vec::new()
+            },
             mta_addr: 0,
             mta_is_a2l: false,
             cal_page: 0,
@@ -399,6 +403,12 @@ pub struct MockXcpServer {
 impl MockXcpServer {
     /// Starts a mock `xcplite` 2.2.2 server bound to `127.0.0.1:port` (or `0` for OS-assigned ephemeral ports).
     pub async fn start(bind_port: u16) -> std::io::Result<Self> {
+        Self::start_with_options(bind_port, true).await
+    }
+
+    /// Like [`MockXcpServer::start`]; with `serve_a2l == false` the target answers `GET_ID` with a
+    /// zero-length A2L, which lets tests exercise the client's local-file fallback.
+    pub async fn start_with_options(bind_port: u16, serve_a2l: bool) -> std::io::Result<Self> {
         let udp_sock = Arc::new(UdpSocket::bind(("127.0.0.1", bind_port)).await?);
         let udp_addr = udp_sock.local_addr()?;
 
@@ -406,7 +416,7 @@ impl MockXcpServer {
         let tcp_addr = tcp_listener.local_addr()?;
 
         let stop_flag = Arc::new(AtomicBool::new(false));
-        let state = Arc::new(Mutex::new(MockSlaveState::new()));
+        let state = Arc::new(Mutex::new(MockSlaveState::new(serve_a2l)));
 
         // Spawn UDP handler + DAQ ticker
         {
@@ -472,7 +482,7 @@ impl MockXcpServer {
                         let _ = stream.set_nodelay(true);
                         let (mut reader, writer) = stream.into_split();
                         let writer = Arc::new(Mutex::new(writer));
-                        let conn_state = Arc::new(Mutex::new(MockSlaveState::new()));
+                        let conn_state = Arc::new(Mutex::new(MockSlaveState::new(serve_a2l)));
                         let conn_stop = Arc::clone(&stop_tcp);
 
                         let writer_daq = Arc::clone(&writer);

@@ -12,10 +12,13 @@
 *.dylib
 *.pdb
 
-# Recorded SDF logfiles
+# Recorded SDF logfiles and plot videos
 /logfile/*.sdf
+/logfile/*.mp4
 /logfile/*.tmp
 *.sdf
+*.mp4
+!tests/fixtures/**
 
 # Local runtime user settings (keep settings.default.json tracked)
 /config/settings.json

@@ -211,13 +211,26 @@ pub struct Measurement {
     pub event_id: Option<u16>,
 }
 
+/// Upper bound on the number of scalar elements one measurement or characteristic may declare.
+/// `MATRIX_DIM` values come from an A2L that may have been uploaded from the target; multiplying
+/// them unchecked could overflow or request gigabytes of staging memory.
+pub const MAX_ELEMENTS_PER_SIGNAL: usize = 1 << 20;
+
+/// Product of `dims` saturated at [`MAX_ELEMENTS_PER_SIGNAL`] (and at least 1).
+pub fn saturating_element_product(dims: &[usize]) -> usize {
+    dims.iter()
+        .try_fold(1usize, |acc, &d| acc.checked_mul(d))
+        .unwrap_or(usize::MAX)
+        .clamp(1, MAX_ELEMENTS_PER_SIGNAL)
+}
+
 impl Measurement {
     /// Total number of scalar elements in this measurement (`1` for scalar, product of dims for arrays).
     pub fn element_count(&self) -> usize {
         if self.matrix_dim.is_empty() {
             1
         } else {
-            self.matrix_dim.iter().copied().product::<usize>().max(1)
+            saturating_element_product(&self.matrix_dim)
         }
     }
 
@@ -273,7 +286,7 @@ impl Characteristic {
         if self.matrix_dim.is_empty() {
             1
         } else {
-            self.matrix_dim.iter().copied().product::<usize>().max(1)
+            saturating_element_product(&self.matrix_dim)
         }
     }
 

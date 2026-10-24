@@ -1,0 +1,9 @@
+{
+  "mcpServers": {
+    "xcp_devtool": {
+      "type": "stdio",
+      "command": "bash",
+      "args": ["tools/xcp_devtool/launch.sh"]
+    }
+  }
+}

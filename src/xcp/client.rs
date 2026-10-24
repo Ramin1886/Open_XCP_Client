@@ -33,7 +33,31 @@ pub enum XcpError {
     A2lUpload(String),
     #[error("Calibration readback verification mismatch (wrote {expected:?}, read {actual:?})")]
     ReadbackMismatch { expected: Vec<u8>, actual: Vec<u8> },
+    #[error("Refusing to transfer {requested} bytes: above the {limit}-byte safety limit")]
+    TransferTooLarge { requested: usize, limit: usize },
 }
+
+/// Where the A2L text handed to the parser came from.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum A2lSource {
+    /// Uploaded from the target via `GET_ID(IDT_ASAM_UPLOAD)` + `UPLOAD`.
+    TargetUpload,
+    /// Read from the configured local fallback file because the upload failed or was empty.
+    LocalFile(std::path::PathBuf),
+}
+
+impl std::fmt::Display for A2lSource {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            A2lSource::TargetUpload => write!(f, "target upload"),
+            A2lSource::LocalFile(p) => write!(f, "local file {}", p.display()),
+        }
+    }
+}
+
+/// Upper bound for any single chunked `UPLOAD` transfer (A2L text or memory read). The length
+/// comes from the target, so it must never be allowed to size an allocation unchecked.
+pub const MAX_UPLOAD_BYTES: usize = 64 * 1024 * 1024;
 
 /// High-level XCP Master Client.
 #[derive(Clone)]
@@ -92,45 +116,80 @@ impl XcpClient {
         Ok(())
     }
 
-    /// Uploads the A2L file directly from the running `xcplite` 2.2.2 target via
-    /// `GET_ID(IDT_ASAM_UPLOAD = 4)` + chunked `UPLOAD`, falling back to `local_fallback_path`
-    /// if provided.
-    pub async fn fetch_a2l(&self, local_fallback_path: Option<&str>) -> Result<String, XcpError> {
-        if let Some(path) = local_fallback_path {
-            let trimmed = path.trim();
-            if !trimmed.is_empty() {
-                if let Ok(content) = std::fs::read_to_string(trimmed) {
-                    if !content.trim().is_empty() {
-                        return Ok(content);
-                    }
+    /// Fetches the A2L text: `GET_ID(IDT_ASAM_UPLOAD = 4)` + chunked `UPLOAD` from the target
+    /// first; only when that fails or yields nothing is `local_fallback_path` read. The returned
+    /// [`A2lSource`] says which one won so the UI can show it.
+    pub async fn fetch_a2l(
+        &self,
+        local_fallback_path: Option<&str>,
+    ) -> Result<(String, A2lSource), XcpError> {
+        let upload_error = match self.upload_a2l_from_target().await {
+            Ok(text) => return Ok((text, A2lSource::TargetUpload)),
+            Err(e) => e,
+        };
+
+        if let Some(path) = local_fallback_path.map(str::trim).filter(|p| !p.is_empty()) {
+            match std::fs::read_to_string(path) {
+                Ok(content) if !content.trim().is_empty() => {
+                    return Ok((content, A2lSource::LocalFile(path.into())));
+                }
+                Ok(_) => {
+                    return Err(XcpError::A2lUpload(format!(
+                        "{upload_error}; local fallback '{path}' is empty"
+                    )));
+                }
+                Err(io) => {
+                    return Err(XcpError::A2lUpload(format!(
+                        "{upload_error}; local fallback '{path}' unreadable: {io}"
+                    )));
                 }
             }
         }
+        Err(upload_error)
+    }
 
-        if let Ok(res) = self
+    /// `GET_ID(IDT_ASAM_UPLOAD)` followed by a chunked `UPLOAD` of the announced length.
+    async fn upload_a2l_from_target(&self) -> Result<String, XcpError> {
+        let res = self
             .transport
             .send_command(&cto::get_id(IDT_ASAM_UPLOAD), self.timeout)
-            .await
-        {
-            if res.len() >= 7 {
-                let a2l_len = u32::from_le_bytes([res[3], res[4], res[5], res[6]]) as usize;
-                if a2l_len > 0 {
-                    let raw_bytes = self.upload_from_current_mta(a2l_len).await?;
-                    let text = String::from_utf8_lossy(&raw_bytes).into_owned();
-                    if !text.trim().is_empty() {
-                        return Ok(text);
-                    }
-                }
-            }
+            .await?;
+        if res.len() < 7 {
+            return Err(XcpError::A2lUpload(format!(
+                "GET_ID response too short ({} bytes)",
+                res.len()
+            )));
         }
-
-        Err(XcpError::A2lUpload(
-            "Target returned zero-length A2L and no local fallback path was provided".to_string(),
-        ))
+        let a2l_len = u32::from_le_bytes([res[3], res[4], res[5], res[6]]) as usize;
+        if a2l_len > MAX_UPLOAD_BYTES {
+            return Err(XcpError::TransferTooLarge {
+                requested: a2l_len,
+                limit: MAX_UPLOAD_BYTES,
+            });
+        }
+        if a2l_len == 0 {
+            return Err(XcpError::A2lUpload(
+                "target reports a zero-length A2L".to_string(),
+            ));
+        }
+        let raw_bytes = self.upload_from_current_mta(a2l_len).await?;
+        let text = String::from_utf8_lossy(&raw_bytes).into_owned();
+        if text.trim().is_empty() {
+            return Err(XcpError::A2lUpload(
+                "target uploaded an empty A2L".to_string(),
+            ));
+        }
+        Ok(text)
     }
 
     /// Uploads `total_len` bytes starting from the target's current MTA using chunked `UPLOAD`.
     pub async fn upload_from_current_mta(&self, total_len: usize) -> Result<Vec<u8>, XcpError> {
+        if total_len > MAX_UPLOAD_BYTES {
+            return Err(XcpError::TransferTooLarge {
+                requested: total_len,
+                limit: MAX_UPLOAD_BYTES,
+            });
+        }
         let mut buffer = Vec::with_capacity(total_len);
         let max_chunk = (self.max_cto.saturating_sub(1)).clamp(1, 255);
 

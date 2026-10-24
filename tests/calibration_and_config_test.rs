@@ -3,12 +3,14 @@
 //! `max_logfile_size_mb` defaulting to 500 MB) and calibration data-type & limit validation.
 
 use open_xcp_client::a2l::parser::parse_a2l;
+use open_xcp_client::app_state::AppController;
 use open_xcp_client::calibration::{
     decode_characteristic_to_display, validate_and_encode_characteristic, CalibrationManager,
     CalibrationSyncStatus, CalibrationValidationError,
 };
 use open_xcp_client::config_store::{ConfigStore, TransportProtocol, DEFAULT_MAX_LOGFILE_SIZE_MB};
 use open_xcp_client::mock_server::sample_adas_a2l::sample_adas_a2l_text;
+use open_xcp_client::plot_profile::ProfileStore;
 use tempfile::tempdir;
 
 #[test]
@@ -203,4 +205,61 @@ fn test_calibration_validator_and_manager_all_types() {
         validate_and_encode_characteristic(mode, &model, "99"),
         Err(CalibrationValidationError::InvalidEnumVariant { .. })
     ));
+}
+
+#[test]
+fn test_malformed_settings_file_is_backed_up_and_reported_not_overwritten() {
+    let dir = tempdir().unwrap();
+    let cfg_path = dir.path().join("settings.json");
+    std::fs::write(&cfg_path, "{ this is not json").unwrap();
+    let store = ConfigStore::new(&cfg_path);
+    assert!(store.load_or_default().is_err());
+
+    let profiles = ProfileStore::new(dir.path().join("profiles"));
+    let controller = AppController::new_with_profile_store(store, profiles);
+    assert!(
+        controller.status_message.contains("could not be read")
+            && controller.status_message.contains("defaults loaded"),
+        "status was: {}",
+        controller.status_message
+    );
+    let backup = dir.path().join("settings.json.bak");
+    assert_eq!(
+        std::fs::read_to_string(&backup).unwrap(),
+        "{ this is not json",
+        "the user's broken file must survive as a backup"
+    );
+    assert_eq!(
+        std::fs::read_to_string(&cfg_path).unwrap(),
+        "{ this is not json",
+        "construction alone must not rewrite the settings file"
+    );
+    assert_eq!(
+        controller.settings.recording.max_logfile_size_mb,
+        DEFAULT_MAX_LOGFILE_SIZE_MB
+    );
+}
+
+#[test]
+fn test_settings_save_is_atomic_and_leaves_no_temp_file() {
+    let dir = tempdir().unwrap();
+    let cfg_path = dir.path().join("settings.json");
+    let store = ConfigStore::new(&cfg_path);
+    let mut settings = store.load_or_default().unwrap();
+    settings.recording.max_logfile_size_mb = 123;
+    store.save(&settings).unwrap();
+    assert!(!dir.path().join("settings.tmp").exists());
+    let names: Vec<String> = std::fs::read_dir(dir.path())
+        .unwrap()
+        .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+        .collect();
+    assert_eq!(names, vec!["settings.json".to_string()], "{names:?}");
+    assert_eq!(
+        store
+            .load_or_default()
+            .unwrap()
+            .recording
+            .max_logfile_size_mb,
+        123
+    );
 }

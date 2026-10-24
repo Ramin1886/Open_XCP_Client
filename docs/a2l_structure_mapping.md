@@ -4,7 +4,7 @@
 
 ## Overview
 
-Embedded ADAS software written in C/C++ frequently organizes sensor clusters, object tracks, and ego-motion states into deeply nested structures and arrays of structures. **Open_XCP_Client** preserves these complex hierarchies end-to-end — from the A2L parser ([`src/a2l/parser.rs`](../src/a2l/parser.rs)) and structure resolver ([`src/a2l/struct_resolver.rs`](../src/a2l/struct_resolver.rs)) to the Logging Tab tree view and the recorded `.sdf` (HDF5 v2) groups.
+Embedded ADAS software written in C/C++ frequently organizes sensor clusters, object tracks, and ego-motion states into deeply nested structures and arrays of structures. **Open_XCP_Client** preserves these complex hierarchies end-to-end — from the A2L parser ([`src/a2l/parser.rs`](../src/a2l/parser.rs)) and structure resolver ([`src/a2l/struct_resolver.rs`](../src/a2l/struct_resolver.rs)) to the Numerical Tab tree view and the recorded `.sdf` dataset paths.
 
 ---
 
@@ -52,4 +52,4 @@ Supported `COMPU_METHOD` types:
 ---
 
 ## Next Steps
-- [HDF5-Based `.sdf` File Format & Configurable Size Splitting →](./sdf_file_format.md)
+- [`.sdf` Container Format & Configurable Size Splitting →](./sdf_file_format.md)

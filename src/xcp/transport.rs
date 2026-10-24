@@ -15,6 +15,13 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpStream, UdpSocket};
 use tokio::sync::{mpsc, Mutex as AsyncMutex};
 
+/// Bounded queue for CTO responses; commands are strictly request/response so a handful suffices,
+/// and a flood of unsolicited responses must not grow memory without limit.
+const CTO_QUEUE_DEPTH: usize = 256;
+/// Bounded queue for DAQ DTOs between the socket reader and the worker; roughly one second of
+/// 1 kHz traffic across all events before overflows are counted in `LinkStats`.
+const DAQ_QUEUE_DEPTH: usize = 8192;
+
 /// Demultiplexed DTO DAQ packet delivered to the recording pipeline.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct IncomingDaqDto {
@@ -60,8 +67,8 @@ impl XcpTransport {
         addr: SocketAddr,
         protocol: TransportProtocol,
     ) -> std::io::Result<(Arc<Self>, mpsc::Receiver<IncomingDaqDto>)> {
-        let (cto_tx, cto_rx) = mpsc::channel::<XcpPacketKind>(256);
-        let (daq_tx, daq_rx) = mpsc::channel::<IncomingDaqDto>(8192);
+        let (cto_tx, cto_rx) = mpsc::channel::<XcpPacketKind>(CTO_QUEUE_DEPTH);
+        let (daq_tx, daq_rx) = mpsc::channel::<IncomingDaqDto>(DAQ_QUEUE_DEPTH);
         let closed = Arc::new(AtomicBool::new(false));
         let link_stats = Arc::new(StdMutex::new(LinkStats::new()));
 

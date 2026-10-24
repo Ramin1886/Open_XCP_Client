@@ -11,7 +11,10 @@ use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::fs::{self, File};
 use std::io::{BufWriter, Write};
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
+
+/// Headroom kept below the configured split size so the next frame never pushes a part over it.
+const MP4_SPLIT_HEADROOM_BYTES: u64 = 32_768;
 
 /// Standard ISO Base Media File Format (`ftypisom`) header signature bytes at offset 4..8.
 pub const MP4_FTYP_MAGIC: &[u8; 4] = b"ftyp";
@@ -569,7 +572,10 @@ impl Mp4VideoRecorder {
     /// Returns `true` if the active `.mp4` file has reached or exceeded `max_file_size_bytes`.
     pub fn should_split(&self, max_file_size_bytes: u64) -> bool {
         self.frames_in_current_part > 0
-            && self.current_part_bytes().saturating_add(32_768) >= max_file_size_bytes.max(4096)
+            && self
+                .current_part_bytes()
+                .saturating_add(MP4_SPLIT_HEADROOM_BYTES)
+                >= max_file_size_bytes.max(4096)
     }
 
     /// Finalizes the current `.mp4` part (`PART{N}.mp4`) and opens `PART{N+1}.mp4`.
@@ -634,52 +640,6 @@ impl Mp4VideoRecorder {
     pub fn completed_files(&self) -> &[PathBuf] {
         &self.completed_files
     }
-}
-
-/// Builds the command-line argument vector for an `ffmpeg` H.264 rawvideo pipe encoder.
-pub fn build_ffmpeg_args(
-    out_path: &Path,
-    width: u32,
-    height: u32,
-    fps: u32,
-    encoder: &str,
-) -> Vec<String> {
-    let mut args = vec![
-        "-y".to_string(),
-        "-loglevel".to_string(),
-        "error".to_string(),
-        "-f".to_string(),
-        "rawvideo".to_string(),
-        "-pix_fmt".to_string(),
-        "rgb24".to_string(),
-        "-s".to_string(),
-        format!("{}x{}", width, height),
-        "-r".to_string(),
-        fps.to_string(),
-        "-i".to_string(),
-        "-".to_string(),
-        "-an".to_string(),
-        "-c:v".to_string(),
-        encoder.to_string(),
-    ];
-    if encoder == "libx264" {
-        args.extend([
-            "-preset".to_string(),
-            "veryfast".to_string(),
-            "-tune".to_string(),
-            "zerolatency".to_string(),
-            "-crf".to_string(),
-            "23".to_string(),
-        ]);
-    }
-    args.extend([
-        "-pix_fmt".to_string(),
-        "yuv420p".to_string(),
-        "-movflags".to_string(),
-        "+frag_keyframe+empty_moov+default_base_moof".to_string(),
-        out_path.to_string_lossy().to_string(),
-    ]);
-    args
 }
 
 fn build_iso_bmff_mp4_header(width: u32, height: u32, fps: u32) -> Vec<u8> {

@@ -1,0 +1,22 @@
+# SPDX-License-Identifier: GPL-2.0-only
+[package]
+name = "xcp_devtool"
+version = "0.1.0"
+edition = "2021"
+license = "GPL-2.0-only"
+description = "Developer CLI and MCP stdio server for inspecting A2L/SDF files, DAQ plans, and project invariants of open_xcp_client"
+publish = false
+
+[dependencies]
+open_xcp_client = { path = "../.." }
+rmcp = { version = "3.7", features = ["server", "transport-io", "macros", "schemars"] }
+schemars = "1"
+clap = { version = "4", features = ["derive"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "1"
+tokio = { version = "1.40", features = ["rt-multi-thread", "macros", "net", "time", "sync", "process", "io-std", "signal"] }
+chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
+
+[dev-dependencies]
+tempfile = "3.12"

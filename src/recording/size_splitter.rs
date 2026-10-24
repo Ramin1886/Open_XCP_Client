@@ -15,12 +15,6 @@ pub struct SizeSplitter {
 }
 
 impl SizeSplitter {
-    /// Creates a new `SizeSplitter` for a given maximum size in megabytes (`1 MB = 1_000_000 bytes`).
-    pub fn from_max_mb(max_size_mb: u64, estimated_header_overhead_bytes: u64) -> Self {
-        let max_bytes = max_size_mb.max(1).saturating_mul(1_000_000);
-        Self::from_max_bytes(max_bytes, estimated_header_overhead_bytes)
-    }
-
     /// Creates a new `SizeSplitter` with an explicit byte limit (useful for fine-grained tests).
     pub fn from_max_bytes(max_file_size_bytes: u64, estimated_header_overhead_bytes: u64) -> Self {
         let clamped_max = max_file_size_bytes.max(8_192);

@@ -13,7 +13,7 @@ permissions:
 
 jobs:
   test-and-coverage:
-    name: Format, Clippy, Tests & >=95% Coverage
+    name: Format, Clippy, Tests, Invariants & >=95% Coverage
     runs-on: ubuntu-latest
     steps:
       - name: Checkout repository
@@ -38,11 +38,17 @@ jobs:
       - name: Check formatting
         run: cargo fmt --all -- --check
 
-      - name: Run Clippy lints
-        run: cargo clippy --all-targets -- -D warnings
+      - name: Run Clippy lints (workspace)
+        run: cargo clippy --workspace --all-targets --locked -- -D warnings
 
-      - name: Run test suite and enforce >=95% line coverage
-        run: cargo llvm-cov --all-targets --workspace --ignore-filename-regex 'src/main\.rs' --lcov --output-path lcov.info --fail-under-lines 95
+      - name: Run product test suite and enforce >=95% line coverage
+        run: cargo llvm-cov --all-targets -p open_xcp_client --locked --ignore-filename-regex 'src/main\.rs' --lcov --output-path lcov.info --fail-under-lines 95
+
+      - name: Run xcp_devtool tests
+        run: cargo test -p xcp_devtool --locked
+
+      - name: Check repository invariants
+        run: cargo run -q -p xcp_devtool --locked -- invariants-check
 
       - name: Upload coverage report artifact
         uses: actions/upload-artifact@v4
