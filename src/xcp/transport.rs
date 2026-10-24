@@ -4,14 +4,16 @@
 //! calibration and recording operate concurrently without blocking.
 
 use crate::config_store::TransportProtocol;
+use crate::xcp::link_stats::LinkStats;
 use crate::xcp::packet::{encode_xcp_ethernet_frame, unpack_xcp_ethernet_frames, XcpPacketKind};
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicBool, AtomicU16, Ordering};
 use std::sync::Arc;
+use std::sync::Mutex as StdMutex;
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpStream, UdpSocket};
-use tokio::sync::{mpsc, Mutex};
+use tokio::sync::{mpsc, Mutex as AsyncMutex};
 
 /// Demultiplexed DTO DAQ packet delivered to the recording pipeline.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -19,6 +21,12 @@ pub struct IncomingDaqDto {
     pub odt_num: u8,
     pub daq_list_num: u8,
     pub payload: Vec<u8>,
+    /// The 16-bit XCP-on-Ethernet `CTR` of the frame this DTO arrived in, kept for diagnostics.
+    pub counter: u16,
+    /// Value of [`LinkStats::generation`] when this DTO was received. A change between
+    /// consecutive DTOs means the link lost, reordered or duplicated frames in between, so any
+    /// half-assembled DAQ cycle must be abandoned.
+    pub link_generation: u64,
 }
 
 enum TransportWriteHalf {
@@ -33,10 +41,16 @@ enum TransportWriteHalf {
 
 /// Asynchronous XCP transport supporting both UDP and TCP.
 pub struct XcpTransport {
-    writer: Mutex<TransportWriteHalf>,
-    cto_rx: Mutex<mpsc::Receiver<XcpPacketKind>>,
+    writer: AsyncMutex<TransportWriteHalf>,
+    cto_rx: AsyncMutex<mpsc::Receiver<XcpPacketKind>>,
     tx_counter: AtomicU16,
     closed: Arc<AtomicBool>,
+    /// Link-integrity counters observed over **every** received frame.
+    ///
+    /// The `CTR` is shared by CTO responses and DAQ DTOs on one connection, so it can only be
+    /// tracked here, where all frames pass. Observing it on DTOs alone would score every command
+    /// response as a gap.
+    link_stats: Arc<StdMutex<LinkStats>>,
 }
 
 impl XcpTransport {
@@ -49,6 +63,7 @@ impl XcpTransport {
         let (cto_tx, cto_rx) = mpsc::channel::<XcpPacketKind>(256);
         let (daq_tx, daq_rx) = mpsc::channel::<IncomingDaqDto>(8192);
         let closed = Arc::new(AtomicBool::new(false));
+        let link_stats = Arc::new(StdMutex::new(LinkStats::new()));
 
         match protocol {
             TransportProtocol::Udp => {
@@ -61,6 +76,7 @@ impl XcpTransport {
                 socket.connect(addr).await?;
                 let rx_sock = Arc::clone(&socket);
                 let closed_clone = Arc::clone(&closed);
+                let stats_clone = Arc::clone(&link_stats);
 
                 tokio::spawn(async move {
                     let mut buf = vec![0u8; 65536];
@@ -69,7 +85,7 @@ impl XcpTransport {
                             Ok(n) if n > 0 => {
                                 let (frames, _) = unpack_xcp_ethernet_frames(&buf[..n]);
                                 for frame in frames {
-                                    dispatch_frame(&frame, &cto_tx, &daq_tx).await;
+                                    dispatch_frame(&frame, &cto_tx, &daq_tx, &stats_clone).await;
                                 }
                             }
                             Ok(_) => break,
@@ -79,13 +95,14 @@ impl XcpTransport {
                 });
 
                 let transport = Arc::new(Self {
-                    writer: Mutex::new(TransportWriteHalf::Udp {
+                    writer: AsyncMutex::new(TransportWriteHalf::Udp {
                         socket,
                         target_addr: addr,
                     }),
-                    cto_rx: Mutex::new(cto_rx),
+                    cto_rx: AsyncMutex::new(cto_rx),
                     tx_counter: AtomicU16::new(0),
                     closed,
+                    link_stats,
                 });
                 Ok((transport, daq_rx))
             }
@@ -94,6 +111,7 @@ impl XcpTransport {
                 let _ = stream.set_nodelay(true);
                 let (mut reader, writer) = stream.into_split();
                 let closed_clone = Arc::clone(&closed);
+                let stats_clone = Arc::clone(&link_stats);
 
                 tokio::spawn(async move {
                     let mut stream_buf = Vec::with_capacity(65536);
@@ -108,7 +126,7 @@ impl XcpTransport {
                                     stream_buf.drain(0..consumed);
                                 }
                                 for frame in frames {
-                                    dispatch_frame(&frame, &cto_tx, &daq_tx).await;
+                                    dispatch_frame(&frame, &cto_tx, &daq_tx, &stats_clone).await;
                                 }
                             }
                             Err(_) => break,
@@ -117,14 +135,23 @@ impl XcpTransport {
                 });
 
                 let transport = Arc::new(Self {
-                    writer: Mutex::new(TransportWriteHalf::Tcp { writer }),
-                    cto_rx: Mutex::new(cto_rx),
+                    writer: AsyncMutex::new(TransportWriteHalf::Tcp { writer }),
+                    cto_rx: AsyncMutex::new(cto_rx),
                     tx_counter: AtomicU16::new(0),
                     closed,
+                    link_stats,
                 });
                 Ok((transport, daq_rx))
             }
         }
+    }
+
+    /// Returns a snapshot of the link-integrity counters observed over every received frame.
+    pub fn link_stats(&self) -> LinkStats {
+        self.link_stats
+            .lock()
+            .map(|s| s.clone())
+            .unwrap_or_default()
     }
 
     /// Sends a CTO command payload and waits up to `timeout` for the corresponding response.
@@ -179,7 +206,19 @@ async fn dispatch_frame(
     frame: &crate::xcp::packet::XcpFrame,
     cto_tx: &mpsc::Sender<XcpPacketKind>,
     daq_tx: &mpsc::Sender<IncomingDaqDto>,
+    link_stats: &StdMutex<LinkStats>,
 ) {
+    // Observe the CTR of every frame, CTO responses included: the counter is shared across the
+    // connection, so skipping CTO frames would make each command response look like a lost
+    // datagram.
+    let link_generation = match link_stats.lock() {
+        Ok(mut stats) => {
+            stats.observe_ctr(frame.counter);
+            stats.generation
+        }
+        Err(_) => 0,
+    };
+
     if let Some(kind) = frame.classify() {
         match kind {
             XcpPacketKind::Response(_) | XcpPacketKind::Error { .. } => {
@@ -190,11 +229,22 @@ async fn dispatch_frame(
                 daq_list_num,
                 payload,
             } => {
-                let _ = daq_tx.try_send(IncomingDaqDto {
-                    odt_num,
-                    daq_list_num,
-                    payload,
-                });
+                // `try_send` keeps the socket reader non-blocking, but a full queue must be
+                // counted: an uncounted drop is indistinguishable from the target sending nothing.
+                if daq_tx
+                    .try_send(IncomingDaqDto {
+                        odt_num,
+                        daq_list_num,
+                        payload,
+                        counter: frame.counter,
+                        link_generation,
+                    })
+                    .is_err()
+                {
+                    if let Ok(mut stats) = link_stats.lock() {
+                        stats.note_channel_overflow(1);
+                    }
+                }
             }
             XcpPacketKind::Event(_) | XcpPacketKind::Service(_) => {}
         }

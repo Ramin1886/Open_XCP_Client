@@ -12,13 +12,16 @@ use crate::config_store::{
 use crate::mock_server::MockXcpServer;
 use crate::plot_profile::{PlotProfile, ProfileStore, ProfileSummary};
 use crate::recording::file_namer::format_utc_for_filename;
-use crate::recording::sdf_writer::SdfSessionRecorder;
+use crate::recording::sdf_writer::{SdfIntegritySummary, SdfSessionRecorder};
 use crate::recording::video_recorder::{
     extract_xy_points_for_layer, render_plane_plot_rgb24, Mp4VideoRecorder, PlaneViewport,
 };
 use crate::replay::SdfReplayPlayer;
 use crate::xcp::client::XcpClient;
-use crate::xcp::daq_planner::{DaqEventSample, DaqPlanner, DecodedValue};
+use crate::xcp::daq_planner::{
+    CycleDiscard, CycleDiscardReason, DaqEventSample, DaqListLossStats, DaqPlanner, DecodedValue,
+};
+use crate::xcp::link_stats::LinkStats;
 use chrono::Utc;
 use crossbeam_channel::{unbounded, Receiver, Sender};
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
@@ -28,6 +31,9 @@ use std::time::{Duration, Instant};
 
 /// Rolling time-series history retention window in seconds (`120.0 s`).
 pub const TIME_SERIES_HISTORY_SECONDS: f64 = 120.0;
+
+/// Maximum number of recent discarded-cycle records retained for display.
+pub const MAX_RECENT_CYCLE_DISCARDS: usize = 64;
 
 /// Duration in seconds for which a changed value stays highlighted in the Numerical tab.
 pub const VALUE_CHANGE_HIGHLIGHT_SECONDS: f64 = 1.0;
@@ -154,6 +160,13 @@ pub enum WorkerEvent {
         reason: String,
     },
     LiveSample(DaqEventSample),
+    /// Link- and DAQ-integrity counters, published whenever they change.
+    LinkIntegrity {
+        link: LinkStats,
+        per_event: Vec<(u16, DaqListLossStats)>,
+        recent_discards: Vec<CycleDiscard>,
+        unplanned_dto: u64,
+    },
     RecordingStarted {
         active_file: PathBuf,
         active_video_file: Option<PathBuf>,
@@ -350,6 +363,14 @@ pub struct AppController {
 
     // XCP Info tab telemetry
     pub event_telemetry: BTreeMap<u16, EventRuntimeStats>,
+    /// Link-level integrity counters (CTR gaps, queue drops) for the XCP Info tab.
+    pub link_stats: LinkStats,
+    /// Per-event DAQ cycle integrity counters, keyed by XCP event channel id.
+    pub event_loss: BTreeMap<u16, DaqListLossStats>,
+    /// Most recent discarded cycles, newest last, capped for display.
+    pub recent_cycle_discards: VecDeque<(f64, CycleDiscard)>,
+    /// Whether integrity was clean at the previous report, so the warning fires on transition.
+    daq_integrity_was_clean: bool,
 
     // Replay mode state
     pub replay_player: Option<SdfReplayPlayer>,
@@ -443,6 +464,10 @@ impl AppController {
             calibration_search_filter: String::new(),
             calibration_manager: CalibrationManager::new(),
             event_telemetry: BTreeMap::new(),
+            link_stats: LinkStats::new(),
+            event_loss: BTreeMap::new(),
+            recent_cycle_discards: VecDeque::new(),
+            daq_integrity_was_clean: true,
             replay_player: None,
             replay_file_input: String::new(),
             last_replay_tick: Instant::now(),
@@ -956,6 +981,33 @@ impl AppController {
         Ok(())
     }
 
+    /// Returns a one-line summary of link and DAQ-cycle integrity for the status bar.
+    pub fn integrity_summary(&self) -> String {
+        let discarded: u64 = self.event_loss.values().map(|s| s.cycles_discarded).sum();
+        let no_header: u64 = self
+            .event_loss
+            .values()
+            .map(|s| s.cycles_lost_no_header)
+            .sum();
+        let seq: u64 = self
+            .event_loss
+            .values()
+            .map(|s| s.odt_sequence_errors)
+            .sum();
+        format!(
+            "{} | cycles discarded {}, missing-header {}, ODT sequence errors {}",
+            self.link_stats.summary(),
+            discarded,
+            no_header,
+            seq
+        )
+    }
+
+    /// Returns `true` when no loss has been observed on the link or in any DAQ list.
+    pub fn daq_integrity_is_clean(&self) -> bool {
+        self.link_stats.is_clean() && self.event_loss.values().all(DaqListLossStats::is_clean)
+    }
+
     /// Returns `true` when `signal` is referenced by the active profile but absent from the A2L.
     pub fn is_signal_unresolved(&self, signal: &str) -> bool {
         self.unresolved_profile_signals.contains(signal)
@@ -1107,6 +1159,30 @@ impl AppController {
                     self.ingest_daq_sample(sample);
                 }
             }
+            WorkerEvent::LinkIntegrity {
+                link,
+                per_event,
+                recent_discards,
+                unplanned_dto,
+            } => {
+                self.link_stats = link;
+                self.link_stats.unplanned_dto = unplanned_dto;
+                self.event_loss = per_event.into_iter().collect();
+                let now = Utc::now().timestamp_millis() as f64 / 1000.0;
+                for discard in recent_discards {
+                    self.recent_cycle_discards.push_back((now, discard));
+                }
+                while self.recent_cycle_discards.len() > MAX_RECENT_CYCLE_DISCARDS {
+                    self.recent_cycle_discards.pop_front();
+                }
+                // Warn on the transition into a lossy state only, so an integrity report never
+                // overwrites an unrelated message on every poll.
+                let now_clean = self.daq_integrity_is_clean();
+                if !now_clean && self.daq_integrity_was_clean {
+                    self.status_message = format!("⚠ DAQ integrity: {}", self.integrity_summary());
+                }
+                self.daq_integrity_was_clean = now_clean;
+            }
             WorkerEvent::RecordingStarted {
                 active_file,
                 active_video_file,
@@ -1244,6 +1320,8 @@ fn run_background_worker(cmd_rx: Receiver<WorkerCommand>, evt_tx: Sender<WorkerE
         .expect("Failed to create Tokio runtime for XCP worker");
 
     rt.block_on(async move {
+        let mut last_reported_link_stats = LinkStats::new();
+        let mut last_link_generation = 0u64;
         let mut mock_server: Option<MockXcpServer> = None;
         let mut active_client: Option<XcpClient> = None;
         let mut active_model: Option<A2lModel> = None;
@@ -1635,10 +1713,21 @@ fn run_background_worker(cmd_rx: Receiver<WorkerCommand>, evt_tx: Sender<WorkerE
             {
                 while let Ok(dto) = rx.try_recv() {
                     processed_any = true;
+
+                    // The transport observes the CTR of every frame (CTO responses included,
+                    // since the counter is shared) and bumps its generation on any discontinuity.
+                    // A change here proves datagrams went missing but not which DAQ list they
+                    // belonged to, so every half-assembled cycle becomes untrustworthy.
+                    if dto.link_generation != last_link_generation {
+                        last_link_generation = dto.link_generation;
+                        planner.invalidate_open_cycles(CycleDiscardReason::LinkDiscontinuity);
+                    }
+
                     if let Some(sample) = planner.process_dto_packet(
                         dto.odt_num,
                         dto.daq_list_num,
                         &dto.payload,
+                        dto.link_generation,
                         model,
                         &mut active_clock_sync,
                     ) {
@@ -1681,6 +1770,73 @@ fn run_background_worker(cmd_rx: Receiver<WorkerCommand>, evt_tx: Sender<WorkerE
                             let _ = evt_tx.send(WorkerEvent::LiveSample(sample));
                         }
                     }
+                }
+            }
+
+            // Publish link and DAQ-cycle integrity counters whenever they move.
+            if let (Some(client), Some(planner)) = (&active_client, &mut active_planner) {
+                let link_stats = client.link_stats();
+                let discards = planner.take_cycle_discards();
+
+                // An active recording carries its own provenance: every discarded cycle becomes an
+                // auditable gap record, so a hole in the data is visible rather than merely absent.
+                if let Some(rec) = &mut recorder_opt {
+                    let host_now = Utc::now().timestamp_millis() as f64 / 1000.0;
+                    for discard in &discards {
+                        let event_name = planner
+                            .lists
+                            .iter()
+                            .find(|l| l.daq_list_num == discard.daq_list_num)
+                            .map(|l| l.event_name.as_str())
+                            .unwrap_or("Unknown");
+                        rec.note_discarded_cycle(
+                            discard.event_channel_id,
+                            event_name,
+                            host_now,
+                            discard.reason.label(),
+                        );
+                    }
+                    let totals = planner.loss_stats().iter().fold(
+                        SdfIntegritySummary {
+                            link_gaps_detected: link_stats.gaps_detected,
+                            link_frames_lost_estimate: link_stats.frames_lost_estimate,
+                            link_reordered: link_stats.reordered,
+                            link_duplicated: link_stats.duplicated,
+                            channel_overflow_drops: link_stats.channel_overflow_drops,
+                            unplanned_dto: planner.unplanned_dto_count(),
+                            measurements_not_acquired: planner.dropped_measurement_indices().len()
+                                as u64,
+                            ..SdfIntegritySummary::default()
+                        },
+                        |mut acc, st| {
+                            acc.cycles_discarded =
+                                acc.cycles_discarded.saturating_add(st.cycles_discarded);
+                            acc.cycles_lost_no_header = acc
+                                .cycles_lost_no_header
+                                .saturating_add(st.cycles_lost_no_header);
+                            acc.odt_sequence_errors = acc
+                                .odt_sequence_errors
+                                .saturating_add(st.odt_sequence_errors);
+                            acc
+                        },
+                    );
+                    rec.set_integrity_counters(totals);
+                }
+
+                if !discards.is_empty() || link_stats != last_reported_link_stats {
+                    let per_event = planner
+                        .lists
+                        .iter()
+                        .zip(planner.loss_stats().iter())
+                        .map(|(l, st)| (l.event_channel_id, *st))
+                        .collect();
+                    let _ = evt_tx.send(WorkerEvent::LinkIntegrity {
+                        link: link_stats.clone(),
+                        per_event,
+                        recent_discards: discards,
+                        unplanned_dto: planner.unplanned_dto_count(),
+                    });
+                    last_reported_link_stats = link_stats;
                 }
             }
 

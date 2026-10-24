@@ -65,9 +65,52 @@ reached; the measurements beyond it are then reported through
 `DaqPlanner::dropped_measurement_indices` and named in the status bar rather than being folded
 into a malformed allocation.
 
+### Data-integrity accounting
+
+A dropped UDP datagram is otherwise invisible: the frame simply never arrives, and nothing
+downstream can tell "the target sent nothing" from "the network ate it". Two mechanisms close that.
+
+**Link level — the 16-bit `CTR`.** Every XCP-on-Ethernet frame carries a `CTR` that the slave
+increments per transmitted frame. [`LinkStats`](../src/xcp/link_stats.rs) tracks the expected
+successor and classifies each arrival as in-order, a gap (with the implied number of lost frames),
+a duplicate or a reorder, counting each and bumping a `generation` on any discontinuity. Wrapping
+arithmetic makes the `0xFFFF` → `0x0000` rollover an ordinary step, never loss. The counter is
+observed in [`transport.rs`](../src/xcp/transport.rs) over **every** received frame, CTO responses
+included — the `CTR` is shared across the connection, so sampling it on DTOs alone would score each
+command response as a lost datagram. DTOs the bounded DAQ queue cannot accept are counted too,
+rather than dropped silently.
+
+**Cycle level — ODT 0 anchors a firing.** One firing of a DAQ list's event arrives as ODTs 0..n.
+ODT 0 carries the DAQ timestamp, which makes it the cycle delimiter:
+[`process_dto_packet`](../src/xcp/daq_planner.rs) lets **only ODT 0 open a cycle** and emits a
+sample only once every planned ODT has arrived exactly once, in increasing order, within that
+cycle and without an intervening link discontinuity.
+
+All three conditions are needed. A seen-ODT mask reset on ODT 0 is not enough on its own, and
+neither is adding strictly increasing ODT numbers: on a two-ODT list, losing ODT 1 of cycle `N` and
+then ODT 0 of cycle `N+1` leaves cycle `N` still open, and ODT 1 of `N+1` follows on with a
+perfectly valid ODT number, so a sample stitched from two different firings would be emitted as
+complete. What rejects it is that both lost datagrams consumed `CTR` values, so the link generation
+moved between the cycle's header and the arriving ODT — non-header ODTs carry no cycle identity of
+their own, so an ODT arriving after a discontinuity cannot be proven to belong to the open cycle.
+
+**Incomplete cycles are discarded, never flagged.** A torn sample has no valid physical
+interpretation, and a flag only protects consumers that check it. Nothing incomplete reaches the
+`.sdf` datasets; what is preserved is the *fact* of the loss, as per-event counters
+(`cycles_discarded`, `cycles_lost_no_header`, `odt_sequence_errors`) and gap records in
+`SdfFileMetadata.integrity` / `.gaps`. A discarded cycle has no trustworthy target timestamp —
+that is exactly what is lost when ODT 0 goes missing — so a gap record carries the host arrival
+time. The effect is that a lossy link lowers the effective sample rate and leaves an auditable
+hole, instead of silently corrupting physical values.
+
+The `XCP Info` tab shows all of it: a **Link & DAQ Integrity** panel for the link counters and
+recent discards, three per-event columns (`Discarded`, `No ODT 0`, `ODT Seq Err`), and a measured
+cycle time flagged when it deviates from the A2L value by more than 25%.
+
 ### Diagnosing "connected but no data"
 
-A DAQ setup that the slave rejects is reported in the status bar immediately after connect, so
+A DAQ setup that the slave rejects is reported in the status bar immediately after connect (and
+after the `Connected` event, so the connect message cannot overwrite it), so
 `Connected — Live DAQ streaming` never stands alone when the allocation actually failed. If DAQ
 starts cleanly and still no DTO arrives, the target application is not triggering its XCP events
 — check that the target's `xcplite` integration actually registers and fires them (a target that

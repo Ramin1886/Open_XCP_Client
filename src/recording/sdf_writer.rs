@@ -63,6 +63,66 @@ pub struct SdfDatasetSummary {
     pub data_byte_len: u64,
 }
 
+/// One stretch of missing data, recorded so a gap is auditable instead of merely absent.
+///
+/// A discarded DAQ cycle has no trustworthy target timestamp — that is precisely what is lost when
+/// ODT 0 goes missing — so the host arrival time is the only honest marker available.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SdfGapRecord {
+    /// XCP event channel whose cycle was discarded.
+    pub event_channel_id: u16,
+    /// Event name, matching the `/Events/<name>` group.
+    pub event_name: String,
+    /// Host UTC time, in seconds, at which the loss was noticed.
+    pub host_time_utc_s: f64,
+    /// Why the cycle was thrown away.
+    pub reason: String,
+    /// Number of consecutive cycles discarded for this reason.
+    pub cycles: u64,
+}
+
+/// Data-integrity provenance for one `.sdf` part.
+///
+/// Recorded alongside the data so a consumer can tell a complete recording from one taken over a
+/// lossy link, without having to infer it from timestamp deltas.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct SdfIntegritySummary {
+    /// Separate link discontinuities observed via the XCP-on-Ethernet `CTR`.
+    pub link_gaps_detected: u64,
+    /// Frames the `CTR` sequence implies were lost.
+    pub link_frames_lost_estimate: u64,
+    /// Frames that arrived out of order.
+    pub link_reordered: u64,
+    /// Frames that repeated a `CTR`.
+    pub link_duplicated: u64,
+    /// DTOs discarded because the in-process DAQ queue was full.
+    pub channel_overflow_drops: u64,
+    /// DTOs naming a DAQ list or ODT that was never allocated.
+    pub unplanned_dto: u64,
+    /// Cycles opened but discarded before completing.
+    pub cycles_discarded: u64,
+    /// Cycles whose ODT 0 never arrived.
+    pub cycles_lost_no_header: u64,
+    /// Out-of-order or duplicate ODT deliveries.
+    pub odt_sequence_errors: u64,
+    /// Measurements excluded at planning time because they did not fit the DAQ lists.
+    pub measurements_not_acquired: u64,
+}
+
+impl SdfIntegritySummary {
+    /// Returns `true` when this part was recorded with no observed loss of any kind.
+    pub fn is_clean(&self) -> bool {
+        *self == Self::default()
+    }
+}
+
+/// Data-integrity provenance for one `.sdf` part: the counters plus the gap records.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct SdfProvenance {
+    pub integrity: SdfIntegritySummary,
+    pub gaps: Vec<SdfGapRecord>,
+}
+
 /// Embedded structural metadata index stored inside the `.sdf` HDF5 file.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct SdfFileMetadata {
@@ -72,6 +132,12 @@ pub struct SdfFileMetadata {
     pub project_name: String,
     pub module_name: String,
     pub datasets: BTreeMap<String, SdfDatasetSummary>,
+    /// Data-integrity provenance for this part.
+    #[serde(default)]
+    pub integrity: SdfIntegritySummary,
+    /// Where data is missing, in host time.
+    #[serde(default)]
+    pub gaps: Vec<SdfGapRecord>,
 }
 
 #[derive(Debug, Clone)]
@@ -107,6 +173,8 @@ pub struct SdfSessionRecorder {
     measurements: BTreeMap<usize, MeasurementAccumulator>,
     completed_files: Vec<PathBuf>,
     total_samples_recorded: u64,
+    /// Integrity provenance for the part currently being accumulated.
+    provenance: SdfProvenance,
 }
 
 impl SdfSessionRecorder {
@@ -175,6 +243,7 @@ impl SdfSessionRecorder {
             1,
             &events,
             &measurements,
+            &SdfProvenance::default(),
         )?;
         let overhead = (base_bytes.len() as u64).saturating_add(512);
         let splitter = SizeSplitter::from_max_bytes(max_file_size_bytes, overhead);
@@ -188,7 +257,58 @@ impl SdfSessionRecorder {
             measurements,
             completed_files: Vec::new(),
             total_samples_recorded: 0,
+            provenance: SdfProvenance::default(),
         })
+    }
+
+    /// Records a discarded DAQ cycle against the active part, so the `.sdf` carries an auditable
+    /// hole rather than silently omitting samples.
+    ///
+    /// Consecutive discards of the same event for the same reason coalesce into one record.
+    pub fn note_discarded_cycle(
+        &mut self,
+        event_channel_id: u16,
+        event_name: &str,
+        host_time_utc_s: f64,
+        reason: &str,
+    ) {
+        self.provenance.integrity.cycles_discarded =
+            self.provenance.integrity.cycles_discarded.saturating_add(1);
+        match self.provenance.gaps.last_mut() {
+            Some(last) if last.event_channel_id == event_channel_id && last.reason == reason => {
+                last.cycles = last.cycles.saturating_add(1);
+            }
+            _ => self.provenance.gaps.push(SdfGapRecord {
+                event_channel_id,
+                event_name: sanitize_hdf5_name(event_name),
+                host_time_utc_s,
+                reason: reason.to_string(),
+                cycles: 1,
+            }),
+        }
+    }
+
+    /// Replaces the integrity counters recorded into the active part's metadata.
+    pub fn set_integrity_counters(&mut self, integrity: SdfIntegritySummary) {
+        // Preserve the discard tally accumulated through `note_discarded_cycle`, which is counted
+        // per part rather than for the whole session.
+        let per_part_discards = self.provenance.integrity.cycles_discarded;
+        self.provenance.integrity = integrity;
+        self.provenance.integrity.cycles_discarded = self
+            .provenance
+            .integrity
+            .cycles_discarded
+            .max(per_part_discards);
+    }
+
+    /// Returns the integrity provenance accumulated for the active part.
+    pub fn integrity(&self) -> &SdfIntegritySummary {
+        &self.provenance.integrity
+    }
+
+    /// Returns the gap records accumulated for the active part.
+    pub fn gaps(&self) -> &[SdfGapRecord] {
+        &self.provenance.gaps
     }
 
     /// Appends a decoded [`DaqEventSample`] to the active recording part.
@@ -281,6 +401,7 @@ impl SdfSessionRecorder {
             self.namer.current_part(),
             &self.events,
             &self.measurements,
+            &self.provenance,
         )?;
 
         let mut file = File::create(&out_path)?;
@@ -296,6 +417,8 @@ impl SdfSessionRecorder {
             m.samples_f64.clear();
             m.sample_count = 0;
         }
+        // Provenance is per part: the next part starts with a clean sheet.
+        self.provenance = SdfProvenance::default();
 
         self.completed_files.push(out_path.clone());
         Ok(out_path)
@@ -370,6 +493,7 @@ fn build_hdf5_sdf_bytes(
     part_number: u32,
     events: &BTreeMap<u16, EventAccumulator>,
     measurements: &BTreeMap<usize, MeasurementAccumulator>,
+    provenance: &SdfProvenance,
 ) -> Result<Vec<u8>, SdfError> {
     let mut buf = Vec::with_capacity(16384);
 
@@ -485,6 +609,8 @@ fn build_hdf5_sdf_bytes(
         project_name: project_name.to_string(),
         module_name: module_name.to_string(),
         datasets: dataset_summaries,
+        integrity: provenance.integrity.clone(),
+        gaps: provenance.gaps.clone(),
     };
     let meta_json = serde_json::to_vec(&metadata)?;
     let meta_len = meta_json.len() as u64;

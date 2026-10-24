@@ -336,6 +336,12 @@ impl XcpClient {
         Ok(())
     }
 
+    /// Returns a snapshot of link-integrity counters (CTR gaps, reordering, duplicates and DAQ
+    /// queue overflow drops) observed across every frame received on this connection.
+    pub fn link_stats(&self) -> crate::xcp::link_stats::LinkStats {
+        self.transport.link_stats()
+    }
+
     /// Returns the negotiated `MAX_DTO` size.
     pub fn max_dto(&self) -> usize {
         self.max_dto
