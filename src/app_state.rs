@@ -393,6 +393,9 @@ pub struct AppController {
 
     cmd_tx: Sender<WorkerCommand>,
     evt_rx: Receiver<WorkerEvent>,
+    /// Handle of the background worker thread, joined (with a deadline) on drop so open
+    /// recordings are finalized before the process exits.
+    worker: Option<std::thread::JoinHandle<()>>,
 }
 
 impl AppController {
@@ -431,7 +434,7 @@ impl AppController {
         let (cmd_tx, cmd_rx) = unbounded::<WorkerCommand>();
         let (evt_tx, evt_rx) = unbounded::<WorkerEvent>();
 
-        std::thread::Builder::new()
+        let worker = std::thread::Builder::new()
             .name("open-xcp-worker".to_string())
             .spawn(move || run_background_worker(cmd_rx, evt_tx))
             .expect("Failed to spawn background XCP worker thread");
@@ -501,6 +504,7 @@ impl AppController {
             status_message: "Ready — Configure target in Settings or click Connect.".to_string(),
             cmd_tx,
             evt_rx,
+            worker: Some(worker),
         };
 
         controller.refresh_profile_list();
@@ -1302,9 +1306,24 @@ impl AppController {
     }
 }
 
+/// How long `Drop` waits for the worker to finalize recordings and disconnect before giving up
+/// and leaving the thread detached (it covers the 2 s command timeout plus a part flush).
+const WORKER_JOIN_TIMEOUT: Duration = Duration::from_secs(3);
+
 impl Drop for AppController {
     fn drop(&mut self) {
+        // Ask the worker to finish open recorders and disconnect, then wait for it so the
+        // process cannot exit (and lose the current part) while finish() is still writing.
         let _ = self.cmd_tx.send(WorkerCommand::Shutdown);
+        if let Some(handle) = self.worker.take() {
+            let deadline = std::time::Instant::now() + WORKER_JOIN_TIMEOUT;
+            while !handle.is_finished() && std::time::Instant::now() < deadline {
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            if handle.is_finished() {
+                let _ = handle.join();
+            }
+        }
     }
 }
 
