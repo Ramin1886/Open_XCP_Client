@@ -816,27 +816,17 @@ impl SdfFileReader {
         if ds.dtype != "float64" {
             return None;
         }
-        let start = ds.data_byte_offset as usize;
-        let end = start + (ds.data_byte_len as usize);
-        if end > self.raw_bytes.len() {
-            return None;
-        }
-        let count = (ds.data_byte_len as usize) / 8;
-        let mut out = Vec::with_capacity(count);
-        for i in 0..count {
-            let o = start + i * 8;
-            out.push(f64::from_le_bytes([
-                self.raw_bytes[o],
-                self.raw_bytes[o + 1],
-                self.raw_bytes[o + 2],
-                self.raw_bytes[o + 3],
-                self.raw_bytes[o + 4],
-                self.raw_bytes[o + 5],
-                self.raw_bytes[o + 6],
-                self.raw_bytes[o + 7],
-            ]));
-        }
-        Some(out)
+        // Offsets come from the file's own index: treat them as untrusted (TODO T-23).
+        let start = usize::try_from(ds.data_byte_offset).ok()?;
+        let len = usize::try_from(ds.data_byte_len).ok()?;
+        let end = start.checked_add(len)?;
+        let bytes = self.raw_bytes.get(start..end)?;
+        Some(
+            bytes
+                .chunks_exact(8)
+                .map(|c| f64::from_le_bytes([c[0], c[1], c[2], c[3], c[4], c[5], c[6], c[7]]))
+                .collect(),
+        )
     }
 
     /// Reads the `i64` values of a 64-bit integer dataset (such as `/Events/<Event>/time_utc_ns`).
@@ -845,26 +835,16 @@ impl SdfFileReader {
         if ds.dtype != "int64" {
             return None;
         }
-        let start = ds.data_byte_offset as usize;
-        let end = start + (ds.data_byte_len as usize);
-        if end > self.raw_bytes.len() {
-            return None;
-        }
-        let count = (ds.data_byte_len as usize) / 8;
-        let mut out = Vec::with_capacity(count);
-        for i in 0..count {
-            let o = start + i * 8;
-            out.push(i64::from_le_bytes([
-                self.raw_bytes[o],
-                self.raw_bytes[o + 1],
-                self.raw_bytes[o + 2],
-                self.raw_bytes[o + 3],
-                self.raw_bytes[o + 4],
-                self.raw_bytes[o + 5],
-                self.raw_bytes[o + 6],
-                self.raw_bytes[o + 7],
-            ]));
-        }
-        Some(out)
+        // Offsets come from the file's own index: treat them as untrusted (TODO T-23).
+        let start = usize::try_from(ds.data_byte_offset).ok()?;
+        let len = usize::try_from(ds.data_byte_len).ok()?;
+        let end = start.checked_add(len)?;
+        let bytes = self.raw_bytes.get(start..end)?;
+        Some(
+            bytes
+                .chunks_exact(8)
+                .map(|c| i64::from_le_bytes([c[0], c[1], c[2], c[3], c[4], c[5], c[6], c[7]]))
+                .collect(),
+        )
     }
 }

@@ -159,3 +159,49 @@ fn test_sdf_recorder_hierarchy_utc_timeseries_and_part_splitting() {
     assert!(namer_empty.filename_for_part(1).starts_with("Measurement_"));
     assert!(!namer_empty.start_utc_human().is_empty());
 }
+
+#[test]
+fn test_sdf_reader_rejects_index_offsets_that_overflow_or_exceed_the_file() {
+    let dir = tempdir().unwrap();
+    let model = parse_a2l(sample_adas_a2l_text()).unwrap();
+    let start = Utc.with_ymd_and_hms(2026, 10, 24, 12, 0, 0).unwrap();
+    let mut recorder = SdfSessionRecorder::new(&model, dir.path(), "Hostile", start, 50_000_000)
+        .expect("recorder");
+    let mut values = BTreeMap::new();
+    values.insert(0usize, DecodedValue::Scalar(1.0));
+    recorder
+        .record_event_sample(&DaqEventSample {
+            daq_list_num: 0,
+            event_channel_id: 0,
+            event_name: "Event_10ms".to_string(),
+            time_utc_s: 1_767_000_000.0,
+            time_utc_ns: 1_767_000_000_000_000_000,
+            values,
+        })
+        .unwrap();
+    let files = recorder.finish().unwrap();
+    let mut reader = SdfFileReader::open(&files[0]).unwrap();
+    let (path, summary) = reader
+        .metadata
+        .datasets
+        .iter()
+        .find(|(_, d)| d.dtype == "float64")
+        .map(|(p, d)| (p.clone(), d.clone()))
+        .expect("a float64 dataset");
+    assert!(
+        reader.read_f64_dataset(&path).is_some(),
+        "sane offsets read fine"
+    );
+
+    // Offset + length wraps around usize: must be None, never a panic.
+    let mut poisoned = summary.clone();
+    poisoned.data_byte_offset = u64::MAX - 4;
+    reader.metadata.datasets.insert(path.clone(), poisoned);
+    assert!(reader.read_f64_dataset(&path).is_none());
+
+    // Length past the end of the file: also None.
+    let mut too_long = summary;
+    too_long.data_byte_len = u64::MAX / 2;
+    reader.metadata.datasets.insert(path.clone(), too_long);
+    assert!(reader.read_f64_dataset(&path).is_none());
+}
