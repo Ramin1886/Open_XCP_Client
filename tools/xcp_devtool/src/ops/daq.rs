@@ -3,12 +3,11 @@
 
 use super::{glob_match, load_a2l, A2lSource};
 use crate::error::DevtoolResult;
-use open_xcp_client::xcp::daq_planner::{DaqPlanner, MAX_ODTS_PER_DAQ_LIST, MAX_ODT_ENTRIES};
+use open_xcp_client::xcp::daq_planner::{
+    DaqPlanner, DTO_HEADER_RESERVE_BYTES, MAX_ODTS_PER_DAQ_LIST, MAX_ODT_ENTRIES,
+};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
-
-/// Bytes the application subtracts from `MAX_DTO` before planning (see `app_state.rs`).
-pub const APP_DTO_HEADER_RESERVE: usize = 6;
 
 /// Input of `daq_plan_dryrun`.
 #[derive(Debug, Clone, Deserialize, JsonSchema)]
@@ -85,7 +84,7 @@ pub fn dryrun(input: &DaqPlanInput) -> DevtoolResult<DaqPlanOutput> {
             problems.push("no measurement matched the given signal filters".to_string());
         }
     }
-    let max_odt_data_bytes = input.max_dto.saturating_sub(APP_DTO_HEADER_RESERVE);
+    let max_odt_data_bytes = input.max_dto.saturating_sub(DTO_HEADER_RESERVE_BYTES);
     let planner = DaqPlanner::from_a2l(&model, max_odt_data_bytes);
 
     let mut violations = Vec::new();

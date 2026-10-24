@@ -20,6 +20,7 @@ use crate::replay::SdfReplayPlayer;
 use crate::xcp::client::XcpClient;
 use crate::xcp::daq_planner::{
     CycleDiscard, CycleDiscardReason, DaqEventSample, DaqListLossStats, DaqPlanner, DecodedValue,
+    DTO_HEADER_RESERVE_BYTES,
 };
 use crate::xcp::link_stats::LinkStats;
 use chrono::Utc;
@@ -28,6 +29,12 @@ use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
+
+/// Idle back-off of the worker loop when neither commands nor DTOs are pending; short enough that
+/// UI commands feel immediate, long enough not to spin a core (replacing it with `select!` is TODO T-15).
+const WORKER_IDLE_POLL: Duration = Duration::from_millis(2);
+/// Maximum points kept per history-trail layer in the 2D plot.
+const TRAIL_MAX_POINTS: usize = 400;
 
 /// Rolling time-series history retention window in seconds (`120.0 s`).
 pub const TIME_SERIES_HISTORY_SECONDS: f64 = 120.0;
@@ -211,8 +218,8 @@ pub fn update_trails_for_layers(
             if !pts.is_empty() {
                 let trail = trails_by_layer.entry(layer.name.clone()).or_default();
                 trail.extend(pts);
-                if trail.len() > 400 {
-                    let excess = trail.len() - 400;
+                if trail.len() > TRAIL_MAX_POINTS {
+                    let excess = trail.len() - TRAIL_MAX_POINTS;
                     trail.drain(0..excess);
                 }
             }
@@ -1417,7 +1424,9 @@ fn run_background_worker(cmd_rx: Receiver<WorkerCommand>, evt_tx: Sender<WorkerE
                                         Ok(model) => {
                                             let planner = DaqPlanner::from_a2l(
                                                 &model,
-                                                client.max_dto().saturating_sub(6),
+                                                client
+                                                    .max_dto()
+                                                    .saturating_sub(DTO_HEADER_RESERVE_BYTES),
                                             );
                                             // Start live DAQ streaming immediately on connect.
                                             // A failure here must be reported: otherwise the UI
@@ -1835,7 +1844,7 @@ fn run_background_worker(cmd_rx: Receiver<WorkerCommand>, evt_tx: Sender<WorkerE
             }
 
             if !processed_any {
-                tokio::time::sleep(Duration::from_millis(2)).await;
+                tokio::time::sleep(WORKER_IDLE_POLL).await;
             }
         }
     });

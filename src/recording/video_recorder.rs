@@ -13,6 +13,9 @@ use std::fs::{self, File};
 use std::io::{BufWriter, Write};
 use std::path::PathBuf;
 
+/// Headroom kept below the configured split size so the next frame never pushes a part over it.
+const MP4_SPLIT_HEADROOM_BYTES: u64 = 32_768;
+
 /// Standard ISO Base Media File Format (`ftypisom`) header signature bytes at offset 4..8.
 pub const MP4_FTYP_MAGIC: &[u8; 4] = b"ftyp";
 
@@ -569,7 +572,10 @@ impl Mp4VideoRecorder {
     /// Returns `true` if the active `.mp4` file has reached or exceeded `max_file_size_bytes`.
     pub fn should_split(&self, max_file_size_bytes: u64) -> bool {
         self.frames_in_current_part > 0
-            && self.current_part_bytes().saturating_add(32_768) >= max_file_size_bytes.max(4096)
+            && self
+                .current_part_bytes()
+                .saturating_add(MP4_SPLIT_HEADROOM_BYTES)
+                >= max_file_size_bytes.max(4096)
     }
 
     /// Finalizes the current `.mp4` part (`PART{N}.mp4`) and opens `PART{N+1}.mp4`.

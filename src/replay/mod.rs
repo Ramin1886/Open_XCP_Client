@@ -13,6 +13,9 @@ use crate::xcp::daq_planner::{DaqEventSample, DecodedValue};
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
+/// Samples emitted per tick at the unbounded ("max") replay speed; bounds UI work per frame.
+const MAX_SPEED_BATCH_SAMPLES: usize = 250;
+
 /// Pre-roll window (in seconds) emitted when seeking so all plots and numerical displays
 /// immediately reflect the signal state at the target seek timestamp.
 pub const SEEK_PREROLL_SECONDS: f64 = 5.0;
@@ -337,7 +340,7 @@ impl SdfReplayPlayer {
         }
 
         if self.speed == 0.0 {
-            let end_idx = (self.cursor_index + 250).min(self.samples.len());
+            let end_idx = (self.cursor_index + MAX_SPEED_BATCH_SAMPLES).min(self.samples.len());
             let emitted = self.samples[self.cursor_index..end_idx].to_vec();
             self.cursor_index = end_idx;
             if let Some(last) = emitted.last() {

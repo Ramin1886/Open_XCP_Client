@@ -16,6 +16,7 @@ use open_xcp_client::mock_server::MockXcpServer;
 use open_xcp_client::recording::{SdfFileReader, SdfSessionRecorder};
 use open_xcp_client::xcp::client::XcpClient;
 use open_xcp_client::xcp::daq_planner::DaqPlanner;
+use open_xcp_client::xcp::daq_planner::DTO_HEADER_RESERVE_BYTES;
 use std::time::Duration;
 use tempfile::tempdir;
 
@@ -41,7 +42,10 @@ async fn run_full_protocol_flow(protocol: TransportProtocol) {
     assert!(model.characteristics.len() >= 6);
 
     // 2. Start DAQ streaming for all measurements grouped by Event refresh rate
-    let mut planner = DaqPlanner::from_a2l(&model, client.max_dto().saturating_sub(6));
+    let mut planner = DaqPlanner::from_a2l(
+        &model,
+        client.max_dto().saturating_sub(DTO_HEADER_RESERVE_BYTES),
+    );
     client
         .configure_and_start_daq(&planner)
         .await
