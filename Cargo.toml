@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: GPL-2.0-only
 [package]
 name = "open_xcp_client"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 license = "GPL-2.0-only"
 description = "Lightweight, high-performance XCP on Ethernet (UDP/TCP) logging (.sdf/HDF5) and calibration client for XCPlite targets"
