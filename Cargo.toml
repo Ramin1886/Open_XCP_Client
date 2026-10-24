@@ -22,7 +22,7 @@ path = "src/main.rs"
 [dependencies]
 eframe = { version = "0.29", default-features = false, features = ["default_fonts", "glow", "x11", "wayland"] }
 egui = "0.29"
-tokio = { version = "1.40", features = ["rt", "rt-multi-thread", "net", "time", "sync", "io-util", "macros"] }
+tokio = { version = "1.40", features = ["rt", "net", "time", "sync", "io-util"] }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 chrono = { version = "0.4", default-features = false, features = ["clock", "std", "serde"] }
@@ -31,6 +31,8 @@ thiserror = "1.0"
 
 [dev-dependencies]
 tempfile = "3.12"
+# `macros` only for `#[tokio::test]`; the library itself builds a current-thread runtime by hand.
+tokio = { version = "1.40", features = ["macros", "rt"] }
 
 [profile.release]
 opt-level = 3
