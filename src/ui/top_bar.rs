@@ -207,6 +207,10 @@ fn render_live_record_bar(ui: &mut Ui, controller: &mut AppController) {
                 "Split Limit: {} MB",
                 controller.settings.recording.max_logfile_size_mb
             ));
+            if let Some(err) = &controller.last_recording_error {
+                ui.colored_label(COLOR_DISCONNECTED, format!("⚠ {err}"))
+                    .on_hover_text(err.clone());
+            }
         }
     });
 }

@@ -195,6 +195,14 @@ pub enum WorkerEvent {
         completed_files: Vec<PathBuf>,
         completed_video_files: Vec<PathBuf>,
     },
+    /// A recorder I/O step failed; the worker has closed both recorders. Parts that reached
+    /// disk before the failure are listed so the UI can still show them.
+    RecordingFailed {
+        stage: &'static str,
+        error: String,
+        completed_files: Vec<PathBuf>,
+        completed_video_files: Vec<PathBuf>,
+    },
     CharacteristicValueRead {
         name: String,
         raw_bytes: Vec<u8>,
@@ -227,9 +235,30 @@ pub fn update_trails_for_layers(
     }
 }
 
-/// Records a [`DaqEventSample`] into `rec` and optionally emits a synchronized 2D video frame
+/// Why a recorder step failed; the worker turns it into [`WorkerEvent::RecordingFailed`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RecordingFailure {
+    /// Which step failed (`"sdf part rotation"`, `"video frame"`, ...).
+    pub stage: &'static str,
+    /// The underlying error text.
+    pub error: String,
+}
+
+impl RecordingFailure {
+    fn new(stage: &'static str, error: impl std::fmt::Display) -> Self {
+        Self {
+            stage,
+            error: error.to_string(),
+        }
+    }
+}
+
+/// Records one DAQ sample into `rec` and, when `emit_video_frame` is set, renders a video frame
 /// into `video_recorder_opt`, rotating both `.sdf` and `.mp4` part files in lockstep whenever
 /// either reaches `rec.max_part_bytes()`.
+///
+/// Any I/O failure is returned instead of being dropped, so the caller can close the recorders
+/// and tell the UI; the DAQ stream itself is unaffected.
 #[allow(clippy::too_many_arguments)]
 pub fn record_synchronized_daq_and_video_sample(
     rec: &mut SdfSessionRecorder,
@@ -242,19 +271,22 @@ pub fn record_synchronized_daq_and_video_sample(
     trails_by_layer: &BTreeMap<String, Vec<(f64, f64)>>,
     sample: DaqEventSample,
     evt_tx: &Sender<WorkerEvent>,
-) {
+) -> Result<(), RecordingFailure> {
     let max_part_bytes = rec.max_part_bytes();
     let mut did_split = false;
 
-    if let Ok(Some(completed_part)) = rec.record_event_sample(&sample) {
-        did_split = true;
-        let _ = evt_tx.send(WorkerEvent::RecordingPartSplit {
-            completed_file: completed_part,
-            new_active_file: rec.current_file_path(),
-            new_part_number: rec.current_part(),
-        });
-        if let Some(vid) = video_recorder_opt.as_mut() {
-            if let Ok(completed_vid) = vid.rotate_part() {
+    match rec.record_event_sample(&sample) {
+        Ok(Some(completed_part)) => {
+            did_split = true;
+            let _ = evt_tx.send(WorkerEvent::RecordingPartSplit {
+                completed_file: completed_part,
+                new_active_file: rec.current_file_path(),
+                new_part_number: rec.current_part(),
+            });
+            if let Some(vid) = video_recorder_opt.as_mut() {
+                let completed_vid = vid
+                    .rotate_part()
+                    .map_err(|e| RecordingFailure::new("video part rotation", e))?;
                 let _ = evt_tx.send(WorkerEvent::VideoPartSplit {
                     completed_video_file: completed_vid,
                     new_active_video_file: vid.current_file_path(),
@@ -262,25 +294,29 @@ pub fn record_synchronized_daq_and_video_sample(
                 });
             }
         }
+        Ok(None) => {}
+        Err(e) => return Err(RecordingFailure::new("sdf part rotation", e)),
     }
 
     if let Some(vid) = video_recorder_opt.as_mut() {
         if emit_video_frame {
             if !did_split && vid.should_split(max_part_bytes) {
-                if let Ok(completed_sdf) = rec.force_rotate_part() {
-                    let _ = evt_tx.send(WorkerEvent::RecordingPartSplit {
-                        completed_file: completed_sdf,
-                        new_active_file: rec.current_file_path(),
-                        new_part_number: rec.current_part(),
-                    });
-                }
-                if let Ok(completed_vid) = vid.rotate_part() {
-                    let _ = evt_tx.send(WorkerEvent::VideoPartSplit {
-                        completed_video_file: completed_vid,
-                        new_active_video_file: vid.current_file_path(),
-                        new_part_number: vid.current_part(),
-                    });
-                }
+                let completed_sdf = rec
+                    .force_rotate_part()
+                    .map_err(|e| RecordingFailure::new("sdf part rotation", e))?;
+                let _ = evt_tx.send(WorkerEvent::RecordingPartSplit {
+                    completed_file: completed_sdf,
+                    new_active_file: rec.current_file_path(),
+                    new_part_number: rec.current_part(),
+                });
+                let completed_vid = vid
+                    .rotate_part()
+                    .map_err(|e| RecordingFailure::new("video part rotation", e))?;
+                let _ = evt_tx.send(WorkerEvent::VideoPartSplit {
+                    completed_video_file: completed_vid,
+                    new_active_video_file: vid.current_file_path(),
+                    new_part_number: vid.current_part(),
+                });
             }
             let rgb = render_plane_plot_rgb24(
                 vid.width(),
@@ -291,7 +327,8 @@ pub fn record_synchronized_daq_and_video_sample(
                 signals_by_name,
                 trails_by_layer,
             );
-            let _ = vid.write_rgb24_frame(&rgb);
+            vid.write_rgb24_frame(&rgb)
+                .map_err(|e| RecordingFailure::new("video frame", e))?;
         }
     }
 
@@ -307,7 +344,9 @@ pub fn record_synchronized_daq_and_video_sample(
         total_samples: rec.total_samples_recorded(),
         latest_sample: sample,
     });
+    Ok(())
 }
+
 /// Shared application controller state manipulated by the UI and tests.
 pub struct AppController {
     pub config_store: ConfigStore,
@@ -324,6 +363,8 @@ pub struct AppController {
     pub log_folder_input: String,
     pub log_prefix_input: String,
     pub is_recording: bool,
+    /// Why the last recording ended abnormally, if it did; cleared when a new one starts.
+    pub last_recording_error: Option<String>,
     pub active_recording_file: Option<PathBuf>,
     pub active_video_file: Option<PathBuf>,
     pub active_part_number: u32,
@@ -456,6 +497,7 @@ impl AppController {
             log_folder_input,
             log_prefix_input,
             is_recording: false,
+            last_recording_error: None,
             active_recording_file: None,
             active_video_file: None,
             active_part_number: 1,
@@ -1215,6 +1257,7 @@ impl AppController {
                 start_utc_human,
             } => {
                 self.is_recording = true;
+                self.last_recording_error = None;
                 self.active_recording_file = Some(active_file.clone());
                 self.active_video_file = active_video_file.clone();
                 self.active_part_number = 1;
@@ -1289,6 +1332,21 @@ impl AppController {
                     self.completed_video_files.len()
                 );
             }
+            WorkerEvent::RecordingFailed {
+                stage,
+                error,
+                completed_files,
+                completed_video_files,
+            } => {
+                self.is_recording = false;
+                self.active_recording_file = None;
+                self.active_video_file = None;
+                self.completed_files.extend(completed_files);
+                self.completed_video_files.extend(completed_video_files);
+                let msg = format!("Recording stopped: {stage} failed: {error}");
+                self.last_recording_error = Some(msg.clone());
+                self.status_message = msg;
+            }
             WorkerEvent::CharacteristicValueRead { name, raw_bytes } => {
                 if let Some(model) = &self.a2l_model {
                     self.calibration_manager
@@ -1354,6 +1412,61 @@ impl Default for WorkerVideoConfig {
     }
 }
 
+/// Closes both recorders (best effort) and reports the outcome: `RecordingFailed` when `failure`
+/// is set or a `finish()` fails, otherwise `RecordingStopped` whenever a recorder existed. Every
+/// path that ends a recording goes through here so the UI can never be left showing "REC".
+fn finish_recorders_and_report(
+    recorder_opt: &mut Option<SdfSessionRecorder>,
+    video_recorder_opt: &mut Option<Mp4VideoRecorder>,
+    failure: Option<RecordingFailure>,
+    finish_stage: &'static str,
+    evt_tx: &Sender<WorkerEvent>,
+) {
+    let had_recorder = recorder_opt.is_some() || video_recorder_opt.is_some();
+    let mut failure = failure;
+    let mut completed_files = Vec::new();
+    let mut completed_video_files = Vec::new();
+    if let Some(mut rec) = recorder_opt.take() {
+        match rec.finish() {
+            Ok(files) => completed_files = files,
+            Err(e) => {
+                completed_files = rec.completed_files().to_vec();
+                failure.get_or_insert_with(|| {
+                    RecordingFailure::new(finish_stage, format!("SDF finalize: {e}"))
+                });
+            }
+        }
+    }
+    if let Some(mut vid) = video_recorder_opt.take() {
+        match vid.finish() {
+            Ok(files) => completed_video_files = files,
+            Err(e) => {
+                completed_video_files = vid.completed_files().to_vec();
+                failure.get_or_insert_with(|| {
+                    RecordingFailure::new(finish_stage, format!("video finalize: {e}"))
+                });
+            }
+        }
+    }
+    match failure {
+        Some(f) => {
+            let _ = evt_tx.send(WorkerEvent::RecordingFailed {
+                stage: f.stage,
+                error: f.error,
+                completed_files,
+                completed_video_files,
+            });
+        }
+        None if had_recorder => {
+            let _ = evt_tx.send(WorkerEvent::RecordingStopped {
+                completed_files,
+                completed_video_files,
+            });
+        }
+        None => {}
+    }
+}
+
 fn run_background_worker(cmd_rx: Receiver<WorkerCommand>, evt_tx: Sender<WorkerEvent>) {
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
@@ -1382,12 +1495,13 @@ fn run_background_worker(cmd_rx: Receiver<WorkerCommand>, evt_tx: Sender<WorkerE
             while let Ok(cmd) = cmd_rx.try_recv() {
                 match cmd {
                     WorkerCommand::Connect { settings } => {
-                        if let Some(mut rec) = recorder_opt.take() {
-                            let _ = rec.finish();
-                        }
-                        if let Some(mut vid) = video_recorder_opt.take() {
-                            let _ = vid.finish();
-                        }
+                        finish_recorders_and_report(
+                            &mut recorder_opt,
+                            &mut video_recorder_opt,
+                            None,
+                            "finalize on reconnect",
+                            &evt_tx,
+                        );
                         if let Some(client) = active_client.take() {
                             let _ = client.disconnect().await;
                         }
@@ -1539,22 +1653,13 @@ fn run_background_worker(cmd_rx: Receiver<WorkerCommand>, evt_tx: Sender<WorkerE
                         }
                     }
                     WorkerCommand::Disconnect => {
-                        let completed_sdf = if let Some(mut rec) = recorder_opt.take() {
-                            rec.finish().unwrap_or_default()
-                        } else {
-                            Vec::new()
-                        };
-                        let completed_mp4 = if let Some(mut vid) = video_recorder_opt.take() {
-                            vid.finish().unwrap_or_default()
-                        } else {
-                            Vec::new()
-                        };
-                        if !completed_sdf.is_empty() || !completed_mp4.is_empty() {
-                            let _ = evt_tx.send(WorkerEvent::RecordingStopped {
-                                completed_files: completed_sdf,
-                                completed_video_files: completed_mp4,
-                            });
-                        }
+                        finish_recorders_and_report(
+                            &mut recorder_opt,
+                            &mut video_recorder_opt,
+                            None,
+                            "finalize on disconnect",
+                            &evt_tx,
+                        );
                         if let Some(client) = active_client.take() {
                             let _ = client.stop_daq().await;
                             let _ = client.disconnect().await;
@@ -1612,8 +1717,9 @@ fn run_background_worker(cmd_rx: Receiver<WorkerCommand>, evt_tx: Sender<WorkerE
                                     let active_file = rec.current_file_path();
                                     let start_utc_human = format_utc_for_filename(start_utc);
                                     let mut active_video_file = None;
+                                    let mut video_failure: Option<RecordingFailure> = None;
                                     if video_cfg.record_video_mp4 {
-                                        if let Ok(mut vid) = Mp4VideoRecorder::new(
+                                        match Mp4VideoRecorder::new(
                                             &folder,
                                             &prefix,
                                             start_utc,
@@ -1622,33 +1728,63 @@ fn run_background_worker(cmd_rx: Receiver<WorkerCommand>, evt_tx: Sender<WorkerE
                                             video_cfg.video_fps,
                                             &video_cfg.video_encoder,
                                         ) {
-                                            // Write initial frame immediately so PART001.mp4 has content
-                                            let rgb = render_plane_plot_rgb24(
-                                                vid.width(),
-                                                vid.height(),
-                                                &video_cfg.viewport,
-                                                &video_cfg.ego,
-                                                &video_cfg.xy_layers,
-                                                &worker_signals_by_name,
-                                                &worker_trails_by_layer,
-                                            );
-                                            let _ = vid.write_rgb24_frame(&rgb);
-                                            active_video_file = Some(vid.current_file_path());
-                                            video_recorder_opt = Some(vid);
-                                            last_video_frame_instant = Instant::now();
+                                            Ok(mut vid) => {
+                                                // Write initial frame immediately so PART001.mp4 has content
+                                                let rgb = render_plane_plot_rgb24(
+                                                    vid.width(),
+                                                    vid.height(),
+                                                    &video_cfg.viewport,
+                                                    &video_cfg.ego,
+                                                    &video_cfg.xy_layers,
+                                                    &worker_signals_by_name,
+                                                    &worker_trails_by_layer,
+                                                );
+                                                match vid.write_rgb24_frame(&rgb) {
+                                                    Ok(()) => {
+                                                        active_video_file =
+                                                            Some(vid.current_file_path());
+                                                        video_recorder_opt = Some(vid);
+                                                        last_video_frame_instant = Instant::now();
+                                                    }
+                                                    Err(e) => {
+                                                        video_failure = Some(
+                                                            RecordingFailure::new("video start", e),
+                                                        );
+                                                    }
+                                                }
+                                            }
+                                            Err(e) => {
+                                                video_failure =
+                                                    Some(RecordingFailure::new("video start", e));
+                                            }
                                         }
                                     }
-                                    recorder_opt = Some(rec);
-                                    let _ = evt_tx.send(WorkerEvent::RecordingStarted {
-                                        active_file,
-                                        active_video_file,
-                                        start_utc_human,
-                                    });
+                                    if let Some(f) = video_failure {
+                                        // The operator asked for .sdf + .mp4 in lockstep; a silent
+                                        // .sdf-only recording would violate that, so refuse to start.
+                                        drop(rec);
+                                        let _ = evt_tx.send(WorkerEvent::RecordingFailed {
+                                            stage: f.stage,
+                                            error: f.error,
+                                            completed_files: Vec::new(),
+                                            completed_video_files: Vec::new(),
+                                        });
+                                    } else {
+                                        recorder_opt = Some(rec);
+                                        let _ = evt_tx.send(WorkerEvent::RecordingStarted {
+                                            active_file,
+                                            active_video_file,
+                                            start_utc_human,
+                                        });
+                                    }
                                 }
                                 Err(e) => {
-                                    let _ = evt_tx.send(WorkerEvent::StatusMessage(format!(
-                                        "Failed to initialize SDF recorder: {e}"
-                                    )));
+                                    let _ = evt_tx.send(WorkerEvent::RecordingFailed {
+                                        stage: "start",
+                                        error: format!("Failed to initialize SDF recorder: {e}"),
+                                        completed_files: Vec::new(),
+                                        completed_video_files: Vec::new(),
+                                    });
                                 }
                             }
                         } else {
@@ -1658,27 +1794,13 @@ fn run_background_worker(cmd_rx: Receiver<WorkerCommand>, evt_tx: Sender<WorkerE
                         }
                     }
                     WorkerCommand::StopRecording => {
-                        let completed_video_files = if let Some(mut vid) = video_recorder_opt.take()
-                        {
-                            vid.finish().unwrap_or_default()
-                        } else {
-                            Vec::new()
-                        };
-                        if let Some(mut rec) = recorder_opt.take() {
-                            match rec.finish() {
-                                Ok(files) => {
-                                    let _ = evt_tx.send(WorkerEvent::RecordingStopped {
-                                        completed_files: files,
-                                        completed_video_files,
-                                    });
-                                }
-                                Err(e) => {
-                                    let _ = evt_tx.send(WorkerEvent::StatusMessage(format!(
-                                        "Error finalizing SDF file: {e}"
-                                    )));
-                                }
-                            }
-                        }
+                        finish_recorders_and_report(
+                            &mut recorder_opt,
+                            &mut video_recorder_opt,
+                            None,
+                            "finalize",
+                            &evt_tx,
+                        );
                     }
                     WorkerCommand::ReadCharacteristic { characteristic } => {
                         if let Some(client) = &active_client {
@@ -1734,12 +1856,13 @@ fn run_background_worker(cmd_rx: Receiver<WorkerCommand>, evt_tx: Sender<WorkerE
                         }
                     }
                     WorkerCommand::Shutdown => {
-                        if let Some(mut rec) = recorder_opt.take() {
-                            let _ = rec.finish();
-                        }
-                        if let Some(mut vid) = video_recorder_opt.take() {
-                            let _ = vid.finish();
-                        }
+                        finish_recorders_and_report(
+                            &mut recorder_opt,
+                            &mut video_recorder_opt,
+                            None,
+                            "finalize on shutdown",
+                            &evt_tx,
+                        );
                         if let Some(client) = active_client.take() {
                             let _ = client.disconnect().await;
                         }
@@ -1785,7 +1908,7 @@ fn run_background_worker(cmd_rx: Receiver<WorkerCommand>, evt_tx: Sender<WorkerE
                             &mut worker_trails_by_layer,
                         );
 
-                        if let Some(rec) = &mut recorder_opt {
+                        let record_result = if let Some(rec) = &mut recorder_opt {
                             let emit_video_frame = video_recorder_opt
                                 .as_ref()
                                 .map(|vid| {
@@ -1808,9 +1931,21 @@ fn run_background_worker(cmd_rx: Receiver<WorkerCommand>, evt_tx: Sender<WorkerE
                                 &worker_trails_by_layer,
                                 sample,
                                 &evt_tx,
-                            );
+                            )
                         } else {
                             let _ = evt_tx.send(WorkerEvent::LiveSample(sample));
+                            Ok(())
+                        };
+                        if let Err(failure) = record_result {
+                            // Disk failed, the link did not: close the recorders, tell the UI,
+                            // and keep draining DTOs so live plots stay alive.
+                            finish_recorders_and_report(
+                                &mut recorder_opt,
+                                &mut video_recorder_opt,
+                                Some(failure),
+                                "finalize after error",
+                                &evt_tx,
+                            );
                         }
                     }
                 }

@@ -720,7 +720,8 @@ async fn test_multi_part_sdf_replay_player_and_all_5_tabs_and_worker_video_split
         &trail_map,
         sample0,
         &evt_tx,
-    );
+    )
+    .expect("direct record must succeed");
     let emitted: Vec<WorkerEvent> = evt_rx.try_iter().collect();
     assert!(emitted
         .iter()
@@ -757,7 +758,8 @@ async fn test_multi_part_sdf_replay_player_and_all_5_tabs_and_worker_video_split
                 values: vals,
             },
             &evt_tx,
-        );
+        )
+        .expect("direct record must succeed");
     }
     let emitted_sdf_split: Vec<WorkerEvent> = evt_rx.try_iter().collect();
     assert!(emitted_sdf_split
