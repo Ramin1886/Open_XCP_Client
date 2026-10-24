@@ -16,7 +16,7 @@ use open_xcp_client::calibration::{
 use open_xcp_client::config_store::{ConfigStore, TransportProtocol};
 use open_xcp_client::mock_server::MockXcpServer;
 use open_xcp_client::recording::{SdfFileReader, SdfSessionRecorder};
-use open_xcp_client::xcp::client::{XcpClient, MAX_UPLOAD_BYTES};
+use open_xcp_client::xcp::client::{A2lSource, XcpClient, MAX_UPLOAD_BYTES};
 use open_xcp_client::xcp::daq_planner::DaqPlanner;
 use open_xcp_client::xcp::daq_planner::DTO_HEADER_RESERVE_BYTES;
 use std::time::Duration;
@@ -35,10 +35,11 @@ async fn run_full_protocol_flow(protocol: TransportProtocol) {
             .expect("Should connect to mock XCPlite 2.2.2 server");
 
     // 1. Fetch A2L dynamically from target via XCP GET_ID + UPLOAD
-    let a2l_text = client
+    let (a2l_text, a2l_source) = client
         .fetch_a2l(None)
         .await
         .expect("Should upload A2L from target");
+    assert_eq!(a2l_source, A2lSource::TargetUpload);
     let model = parse_a2l(&a2l_text).expect("Uploaded A2L should parse cleanly");
 
     // A length announced by the target must never size an allocation unchecked.
@@ -256,4 +257,46 @@ fn test_dropping_the_controller_while_recording_finalizes_the_part_file() {
         on_disk >= 5,
         "samples recorded before drop must be on disk, found {on_disk}"
     );
+}
+
+#[tokio::test]
+async fn test_local_a2l_is_a_fallback_used_only_when_the_upload_fails() {
+    // A target that answers GET_ID with a zero-length A2L: the upload fails cleanly.
+    let server = MockXcpServer::start_with_options(0, false).await.unwrap();
+    let (client, _clock, _daq_rx) = XcpClient::connect(
+        server.udp_addr,
+        TransportProtocol::Udp,
+        Duration::from_secs(2),
+        true,
+    )
+    .await
+    .unwrap();
+
+    let no_fallback = client.fetch_a2l(None).await.expect_err("no A2L anywhere");
+    assert!(
+        no_fallback.to_string().contains("zero-length"),
+        "{no_fallback}"
+    );
+
+    let dir = tempdir().unwrap();
+    let local = dir.path().join("fallback.a2l");
+    std::fs::write(&local, sample_a2l()).unwrap();
+    let (text, source) = client
+        .fetch_a2l(Some(local.to_str().unwrap()))
+        .await
+        .expect("local file must be used when the upload fails");
+    assert_eq!(source, A2lSource::LocalFile(local.clone()));
+    assert!(text.contains("OpenXcpAdasProject"));
+
+    let missing = client
+        .fetch_a2l(Some("/nonexistent/fallback.a2l"))
+        .await
+        .expect_err("unreadable fallback cannot rescue a failed upload");
+    assert!(missing.to_string().contains("unreadable"), "{missing}");
+    client.disconnect().await.unwrap();
+    server.stop();
+}
+
+fn sample_a2l() -> &'static str {
+    open_xcp_client::mock_server::sample_adas_a2l::sample_adas_a2l_text()
 }

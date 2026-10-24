@@ -131,15 +131,19 @@ async fn test_xcp_client_and_mock_server_extended_commands_and_fallbacks() {
         .await
         .unwrap();
 
-    // Local A2L fallback file test
+    // With a working target the upload wins even when a local file is configured.
     let dir = tempdir().unwrap();
     let local_a2l = dir.path().join("fallback.a2l");
     std::fs::write(&local_a2l, sample_adas_a2l_text()).unwrap();
-    let loaded = client
+    let (loaded, source) = client
         .fetch_a2l(Some(local_a2l.to_str().unwrap()))
         .await
         .unwrap();
     assert!(loaded.contains("OpenXcpAdasProject"));
+    assert_eq!(
+        source,
+        open_xcp_client::xcp::client::A2lSource::TargetUpload
+    );
 
     client.disconnect().await.unwrap();
     server.stop();
@@ -568,12 +572,16 @@ async fn test_remaining_config_client_validator_and_worker_branches() {
     .await
     .unwrap();
 
-    // Nonexistent local fallback falls back to XCP GET_ID + UPLOAD
-    let uploaded = client
+    // A nonexistent local path is irrelevant while the upload succeeds
+    let (uploaded, source) = client
         .fetch_a2l(Some("/nonexistent/fallback.a2l"))
         .await
         .unwrap();
     assert!(uploaded.contains("OpenXcpAdasProject"));
+    assert_eq!(
+        source,
+        open_xcp_client::xcp::client::A2lSource::TargetUpload
+    );
 
     // Empty DAQ planner
     let empty_planner = DaqPlanner::from_a2l(&open_xcp_client::a2l::model::A2lModel::default(), 64);
@@ -612,7 +620,8 @@ async fn test_remaining_config_client_validator_and_worker_branches() {
     assert!(ctrl.status_message.contains("was not written"));
     assert!(!ctrl.status_message.contains("Sent calibration update"));
 
-    // Connect with built-in mock server over TCP + broken local A2L fallback -> triggers A2L parse error
+    // A broken local file is a fallback only: with the built-in mock serving a valid A2L the
+    // upload wins and the connection succeeds. (The parse-error path is covered directly below.)
     let broken_a2l = dir.path().join("broken.a2l");
     std::fs::write(&broken_a2l, "/begin MEASUREMENT Unclosed").unwrap();
     ctrl.settings.ui.enable_mock_server = true;
@@ -620,13 +629,14 @@ async fn test_remaining_config_client_validator_and_worker_branches() {
     ctrl.settings.connection.local_a2l_fallback_path = broken_a2l.display().to_string();
     ctrl.request_connect();
     assert!(
-        common::wait_until_async(&mut ctrl, Duration::from_secs(3), |c| {
-            c.status_message.contains("A2L parse error")
-        })
-        .await,
+        common::wait_until_async(&mut ctrl, Duration::from_secs(3), |c| c.connected).await,
         "status: {}",
         ctrl.status_message
     );
+    assert!(ctrl.status_message.contains("A2L from target upload"));
+    assert!(parse_a2l("/begin MEASUREMENT Unclosed").is_err());
+    ctrl.request_disconnect();
+    assert!(common::wait_until_async(&mut ctrl, Duration::from_secs(3), |c| !c.connected).await);
 
     // 5. A2L parser short/malformed block guards, event time units, and typedef/instance keyword branches
     assert!(parse_a2l("/begin").is_err());

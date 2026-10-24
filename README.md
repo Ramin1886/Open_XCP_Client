@@ -71,7 +71,7 @@ flowchart LR
 ## Core Capabilities
 
 ### 1. Dynamic Target A2L Upload & Immediate Live DAQ Streaming
-- Automatically queries the running `xcplite` 2.2.2 server using `GET_ID (IDT_ASAM_UPLOAD = 4)` followed by chunked `UPLOAD` transfers to retrieve the target's A2L specification directly over Ethernet (if `connection.local_a2l_fallback_path` is set, that file is used **instead of** the upload).
+- Automatically queries the running `xcplite` 2.2.2 server using `GET_ID (IDT_ASAM_UPLOAD = 4)` followed by chunked `UPLOAD` transfers to retrieve the target's A2L specification directly over Ethernet (with an optional local `.a2l` file that is read only when the upload fails or is empty; the connect status says which source was used).
 - Reconstructs complex C/C++ data structures from both ASAM MCD-2 MC v1.7 `TYPEDEF_STRUCTURE` / `STRUCTURE_COMPONENT` / `INSTANCE` declarations and hierarchical symbol paths (e.g., `Perception.RadarFront.targets[0].distance_m`), preserving all nested attributes and multidimensional (`MATRIX_DIM`) arrays.
 - Starts live DAQ streaming immediately on connect so all visualization and numerical tabs update in real time before recording to disk.
 
@@ -166,7 +166,7 @@ Runtime settings are stored in `./config/settings.json` (seeded from [`./config/
 | `connection.target_port` | `u16` | `5555` | UDP/TCP port of the `xcplite` server |
 | `connection.transport` | `"Udp"` \| `"Tcp"` | `"Udp"` | XCP-on-Ethernet transport layer protocol |
 | `connection.connect_timeout_ms` | `u64` | `2000` | Command response timeout in milliseconds |
-| `connection.local_a2l_fallback_path` | `string` | `""` | Optional local `.a2l` path; when set it is used **instead of** the target upload (T-08) |
+| `connection.local_a2l_fallback_path` | `string` | `""` | Optional local `.a2l` path, read only when the target upload fails or is empty |
 | `recording.default_log_folder` | `string` | `"./logfile"` | Output directory for recorded `.sdf` and `.mp4` files |
 | `recording.default_file_prefix` | `string` | `"Measurement"` | Prefix used for `<Prefix>_<UTC>_PARTxxx.{sdf,mp4}` |
 | `recording.max_logfile_size_mb` | `u64` | `500` | Maximum size per `.sdf` or `.mp4` part file in megabytes |

@@ -1579,7 +1579,7 @@ fn run_background_worker(cmd_rx: Receiver<WorkerCommand>, evt_tx: Sender<WorkerE
                                     Some(settings.connection.local_a2l_fallback_path.as_str())
                                 };
                                 match client.fetch_a2l(fallback).await {
-                                    Ok(a2l_text) => match parse_a2l(&a2l_text) {
+                                    Ok((a2l_text, a2l_source)) => match parse_a2l(&a2l_text) {
                                         Ok(model) => {
                                             let planner = DaqPlanner::from_a2l(
                                                 &model,
@@ -1609,9 +1609,10 @@ fn run_background_worker(cmd_rx: Receiver<WorkerCommand>, evt_tx: Sender<WorkerE
 
                                             let _ = evt_tx.send(WorkerEvent::Connected {
                                                 target_endpoint: format!(
-                                                    "{} ({})",
+                                                    "{} ({}, A2L from {})",
                                                     target_addr,
-                                                    settings.connection.transport.as_str()
+                                                    settings.connection.transport.as_str(),
+                                                    a2l_source
                                                 ),
                                                 a2l_model: Box::new(model),
                                                 target_native_utc: native_utc,
