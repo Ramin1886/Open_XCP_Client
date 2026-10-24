@@ -6,6 +6,18 @@ use crate::a2l::model::{A2lModel, Measurement};
 use crate::xcp::clock_sync::TargetClockSync;
 use std::collections::BTreeMap;
 
+/// Maximum number of ODT entries in a single ODT.
+///
+/// `ALLOC_ODT_ENTRY` and `SET_DAQ_PTR` carry the ODT entry number in one byte, so an ODT can
+/// hold at most 255 entries regardless of how many would still fit in `MAX_DTO`. Exceeding this
+/// makes a slave reject the allocation with `ERR_MEMORY_OVERFLOW (0x22)`.
+pub const MAX_ODT_ENTRIES: usize = 255;
+
+/// Maximum number of ODTs in a single DAQ list.
+///
+/// `ALLOC_ODT` and `SET_DAQ_PTR` carry the ODT number in one byte.
+pub const MAX_ODTS_PER_DAQ_LIST: usize = 255;
+
 /// Decoded physical value of a measurement (either a scalar or a flattened N-D array).
 #[derive(Debug, Clone, PartialEq)]
 pub enum DecodedValue {
@@ -66,6 +78,10 @@ pub struct DaqListPlan {
     pub refresh_rate_ms: u64,
     pub odts: Vec<DaqOdtPlan>,
     pub measurement_indices: Vec<usize>,
+    /// Measurements that did not fit within [`MAX_ODTS_PER_DAQ_LIST`] and are therefore not
+    /// acquired. Reported to the user rather than silently truncated into a malformed
+    /// allocation.
+    pub dropped_measurement_indices: Vec<usize>,
 }
 
 /// A complete decoded sample frame for one firing of an XCP Event channel.
@@ -90,9 +106,25 @@ pub struct DaqPlanner {
     staging_ts: Vec<Option<u32>>,
 }
 
+/// Returns the measurement-data budget of one ODT, reserving 4 bytes for the DAQ timestamp
+/// that the slave prepends to the first ODT of every DAQ list.
+fn odt_payload_budget(is_first_odt: bool, max_payload: usize) -> usize {
+    if is_first_odt {
+        max_payload.saturating_sub(4).max(1)
+    } else {
+        max_payload
+    }
+}
+
 impl DaqPlanner {
     /// Builds a `DaqPlanner` grouping all measurements in `model` by their A2L `event_id`.
     /// `max_odt_data_bytes` specifies the maximum measurement payload per ODT (e.g., 248 for Ethernet).
+    ///
+    /// Each ODT is bounded both by that payload and by [`MAX_ODT_ENTRIES`], and each DAQ list by
+    /// [`MAX_ODTS_PER_DAQ_LIST`], so the `u8` ODT and entry counters in `ALLOC_ODT`,
+    /// `ALLOC_ODT_ENTRY` and `SET_DAQ_PTR` can never be truncated. Exactly one DAQ list is
+    /// planned per XCP event channel; measurements that do not fit are reported through
+    /// [`DaqPlanner::dropped_measurement_indices`] instead of being silently truncated.
     pub fn from_a2l(model: &A2lModel, max_odt_data_bytes: usize) -> Self {
         let max_payload = max_odt_data_bytes.clamp(16, 1024);
         let default_event_id = model.events.keys().copied().next().unwrap_or(0);
@@ -115,26 +147,43 @@ impl DaqPlanner {
                 .map(|ev| (ev.name.clone(), (ev.cycle_time_us / 1_000).max(1)))
                 .unwrap_or_else(|| (format!("Event_{}", event_channel_id), 10));
 
-            let mut odts = Vec::new();
-            let mut current_entries = Vec::new();
+            // An ODT is closed when either the DTO payload is full or it already holds
+            // MAX_ODT_ENTRIES entries. The first ODT of a list reserves 4 bytes for the
+            // DAQ timestamp, so it carries correspondingly less measurement data.
+            let mut odts: Vec<DaqOdtPlan> = Vec::new();
+            let mut current_entries: Vec<DaqOdtEntryPlan> = Vec::new();
             let mut current_bytes = 0usize;
-            let mut odt_num = 0u8;
+            let mut kept_indices: Vec<usize> = Vec::new();
+            let mut dropped_indices: Vec<usize> = Vec::new();
+            let mut list_full = false;
 
             for &m_idx in &meas_indices {
+                if list_full {
+                    dropped_indices.push(m_idx);
+                    continue;
+                }
                 let m = &model.measurements[m_idx];
                 let total_bytes = m.total_byte_size();
                 let mut offset = 0usize;
 
                 while offset < total_bytes {
-                    let chunk = (total_bytes - offset).min(128).min(max_payload);
-                    if !current_entries.is_empty() && current_bytes + chunk > max_payload {
+                    let budget = odt_payload_budget(odts.is_empty(), max_payload);
+                    let chunk = (total_bytes - offset).min(128).min(budget);
+                    let full = !current_entries.is_empty()
+                        && (current_bytes + chunk > budget
+                            || current_entries.len() >= MAX_ODT_ENTRIES);
+                    if full {
+                        if odts.len() >= MAX_ODTS_PER_DAQ_LIST {
+                            list_full = true;
+                            break;
+                        }
                         odts.push(DaqOdtPlan {
-                            odt_num,
-                            has_timestamp: odt_num == 0,
+                            odt_num: odts.len() as u8,
+                            has_timestamp: odts.is_empty(),
                             entries: std::mem::take(&mut current_entries),
                         });
-                        odt_num = odt_num.saturating_add(1);
                         current_bytes = 0;
+                        continue;
                     }
                     current_entries.push(DaqOdtEntryPlan {
                         measurement_index: m_idx,
@@ -146,18 +195,31 @@ impl DaqPlanner {
                     current_bytes += chunk;
                     offset += chunk;
                 }
+
+                if list_full {
+                    // This measurement is only partially planned; drop it whole — including any
+                    // entries already placed in earlier ODTs — so no measurement is ever
+                    // half-acquired.
+                    current_entries.retain(|e| e.measurement_index != m_idx);
+                    for odt in &mut odts {
+                        odt.entries.retain(|e| e.measurement_index != m_idx);
+                    }
+                    dropped_indices.push(m_idx);
+                } else {
+                    kept_indices.push(m_idx);
+                }
             }
 
-            if !current_entries.is_empty() {
+            if !current_entries.is_empty() && odts.len() < MAX_ODTS_PER_DAQ_LIST {
                 odts.push(DaqOdtPlan {
-                    odt_num,
-                    has_timestamp: odt_num == 0,
+                    odt_num: odts.len() as u8,
+                    has_timestamp: odts.is_empty(),
                     entries: current_entries,
                 });
             }
 
             let mut init_map = BTreeMap::new();
-            for &m_idx in &meas_indices {
+            for &m_idx in &kept_indices {
                 init_map.insert(
                     m_idx,
                     vec![0u8; model.measurements[m_idx].total_byte_size()],
@@ -170,7 +232,8 @@ impl DaqPlanner {
                 event_name,
                 refresh_rate_ms,
                 odts,
-                measurement_indices: meas_indices,
+                measurement_indices: kept_indices,
+                dropped_measurement_indices: dropped_indices,
             });
             staging_bytes.push(init_map);
             staging_ts.push(None);
@@ -181,6 +244,37 @@ impl DaqPlanner {
             staging_bytes,
             staging_ts,
         }
+    }
+
+    /// Returns every measurement index that did not fit into its DAQ list and is therefore
+    /// not acquired.
+    pub fn dropped_measurement_indices(&self) -> Vec<usize> {
+        let mut out: Vec<usize> = self
+            .lists
+            .iter()
+            .flat_map(|l| l.dropped_measurement_indices.iter().copied())
+            .collect();
+        out.sort_unstable();
+        out
+    }
+
+    /// Returns the total number of ODT entries across all planned DAQ lists.
+    pub fn total_odt_entries(&self) -> usize {
+        self.lists
+            .iter()
+            .flat_map(|l| l.odts.iter())
+            .map(|o| o.entries.len())
+            .sum()
+    }
+
+    /// Returns the total measurement payload in bytes across all planned DAQ lists.
+    pub fn total_daq_bytes(&self) -> usize {
+        self.lists
+            .iter()
+            .flat_map(|l| l.odts.iter())
+            .flat_map(|o| o.entries.iter())
+            .map(|e| e.byte_size as usize)
+            .sum()
     }
 
     /// Processes a single incoming DAQ DTO packet. When the final ODT of a DAQ list is received,

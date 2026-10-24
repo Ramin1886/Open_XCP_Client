@@ -1347,8 +1347,18 @@ fn run_background_worker(cmd_rx: Receiver<WorkerCommand>, evt_tx: Sender<WorkerE
                                                 &model,
                                                 client.max_dto().saturating_sub(6),
                                             );
-                                            // Start live DAQ streaming immediately on connect
-                                            let _ = client.configure_and_start_daq(&planner).await;
+                                            // Start live DAQ streaming immediately on connect.
+                                            // A failure here must be reported: otherwise the UI
+                                            // claims "Live DAQ streaming" while no DTO ever
+                                            // arrives, with nothing to distinguish a rejected DAQ
+                                            // setup from a target that never triggers its events.
+                                            let daq_error = client
+                                                .configure_and_start_daq(&planner)
+                                                .await
+                                                .err()
+                                                .map(|e| e.to_string());
+                                            let dropped =
+                                                planner.dropped_measurement_indices().len();
 
                                             let native_utc = clock_sync.is_target_native_utc();
                                             active_clock_sync = clock_sync;
@@ -1366,6 +1376,26 @@ fn run_background_worker(cmd_rx: Receiver<WorkerCommand>, evt_tx: Sender<WorkerE
                                                 a2l_model: Box::new(model),
                                                 target_native_utc: native_utc,
                                             });
+
+                                            // Sent after Connected so the connect status
+                                            // message cannot overwrite these diagnostics.
+                                            if let Some(err) = daq_error {
+                                                let _ = evt_tx.send(WorkerEvent::StatusMessage(
+                                                    format!(
+                                                        "Failed to start DAQ on target: {err} — \
+                                                         connected, but no live data will arrive"
+                                                    ),
+                                                ));
+                                            } else if dropped > 0 {
+                                                let _ = evt_tx.send(WorkerEvent::StatusMessage(
+                                                    format!(
+                                                        "Live DAQ started, but {dropped} \
+                                                         measurement(s) exceed the per-DAQ-list \
+                                                         ODT limit of this target and are not \
+                                                         acquired"
+                                                    ),
+                                                ));
+                                            }
                                         }
                                         Err(e) => {
                                             let _ = evt_tx.send(WorkerEvent::Disconnected {
@@ -1440,8 +1470,9 @@ fn run_background_worker(cmd_rx: Receiver<WorkerCommand>, evt_tx: Sender<WorkerE
                         prefix,
                         max_size_bytes,
                     } => {
-                        if let (Some(client), Some(model), Some(planner)) =
-                            (&active_client, &active_model, &active_planner)
+                        if let Some(model) = active_model
+                            .as_ref()
+                            .filter(|_| active_client.is_some() && active_planner.is_some())
                         {
                             let start_utc = Utc::now();
                             match SdfSessionRecorder::new(
@@ -1452,47 +1483,46 @@ fn run_background_worker(cmd_rx: Receiver<WorkerCommand>, evt_tx: Sender<WorkerE
                                 max_size_bytes,
                             ) {
                                 Ok(rec) => {
-                                    if let Err(e) = client.configure_and_start_daq(planner).await {
-                                        let _ = evt_tx.send(WorkerEvent::StatusMessage(format!(
-                                            "Failed to start DAQ on target: {e}"
-                                        )));
-                                    } else {
-                                        let active_file = rec.current_file_path();
-                                        let start_utc_human = format_utc_for_filename(start_utc);
-                                        let mut active_video_file = None;
-                                        if video_cfg.record_video_mp4 {
-                                            if let Ok(mut vid) = Mp4VideoRecorder::new(
-                                                &folder,
-                                                &prefix,
-                                                start_utc,
-                                                video_cfg.video_width,
-                                                video_cfg.video_height,
-                                                video_cfg.video_fps,
-                                                &video_cfg.video_encoder,
-                                            ) {
-                                                // Write initial frame immediately so PART001.mp4 has content
-                                                let rgb = render_plane_plot_rgb24(
-                                                    vid.width(),
-                                                    vid.height(),
-                                                    &video_cfg.viewport,
-                                                    &video_cfg.ego,
-                                                    &video_cfg.xy_layers,
-                                                    &worker_signals_by_name,
-                                                    &worker_trails_by_layer,
-                                                );
-                                                let _ = vid.write_rgb24_frame(&rgb);
-                                                active_video_file = Some(vid.current_file_path());
-                                                video_recorder_opt = Some(vid);
-                                                last_video_frame_instant = Instant::now();
-                                            }
+                                    // DAQ is configured and streaming from the moment we
+                                    // connect, and StopRecording never stops it, so recording
+                                    // is purely host-side. Re-running the DAQ setup here would
+                                    // tear down a working configuration (and some slaves reject
+                                    // the re-allocation outright with ERR_MEMORY_OVERFLOW).
+                                    let active_file = rec.current_file_path();
+                                    let start_utc_human = format_utc_for_filename(start_utc);
+                                    let mut active_video_file = None;
+                                    if video_cfg.record_video_mp4 {
+                                        if let Ok(mut vid) = Mp4VideoRecorder::new(
+                                            &folder,
+                                            &prefix,
+                                            start_utc,
+                                            video_cfg.video_width,
+                                            video_cfg.video_height,
+                                            video_cfg.video_fps,
+                                            &video_cfg.video_encoder,
+                                        ) {
+                                            // Write initial frame immediately so PART001.mp4 has content
+                                            let rgb = render_plane_plot_rgb24(
+                                                vid.width(),
+                                                vid.height(),
+                                                &video_cfg.viewport,
+                                                &video_cfg.ego,
+                                                &video_cfg.xy_layers,
+                                                &worker_signals_by_name,
+                                                &worker_trails_by_layer,
+                                            );
+                                            let _ = vid.write_rgb24_frame(&rgb);
+                                            active_video_file = Some(vid.current_file_path());
+                                            video_recorder_opt = Some(vid);
+                                            last_video_frame_instant = Instant::now();
                                         }
-                                        recorder_opt = Some(rec);
-                                        let _ = evt_tx.send(WorkerEvent::RecordingStarted {
-                                            active_file,
-                                            active_video_file,
-                                            start_utc_human,
-                                        });
                                     }
+                                    recorder_opt = Some(rec);
+                                    let _ = evt_tx.send(WorkerEvent::RecordingStarted {
+                                        active_file,
+                                        active_video_file,
+                                        start_utc_human,
+                                    });
                                 }
                                 Err(e) => {
                                     let _ = evt_tx.send(WorkerEvent::StatusMessage(format!(
