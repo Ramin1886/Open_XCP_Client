@@ -409,7 +409,25 @@ impl AppController {
     /// After construction, the profile named by `settings.active_profile` is loaded and applied,
     /// so the last-used measurement view is restored across sessions.
     pub fn new_with_profile_store(config_store: ConfigStore, profile_store: ProfileStore) -> Self {
-        let settings = config_store.load_or_default().unwrap_or_default();
+        // A malformed settings file must never be silently replaced: keep a backup, start from
+        // defaults, and tell the user (the first save would otherwise overwrite their file).
+        let (settings, settings_load_error) = match config_store.load_or_default() {
+            Ok(settings) => (settings, None),
+            Err(err) => {
+                let path = config_store.path().to_path_buf();
+                let backup = path.with_extension("json.bak");
+                let backup_note = match std::fs::copy(&path, &backup) {
+                    Ok(_) => format!("backed up to '{}'", backup.display()),
+                    Err(copy_err) => format!("backup failed: {copy_err}"),
+                };
+                (
+                    AppSettings::default(),
+                    Some(format!(
+                        "Settings file could not be read ({err}); {backup_note}; defaults loaded"
+                    )),
+                )
+            }
+        };
         let (cmd_tx, cmd_rx) = unbounded::<WorkerCommand>();
         let (evt_tx, evt_rx) = unbounded::<WorkerEvent>();
 
@@ -493,6 +511,9 @@ impl AppController {
                 controller.status_message =
                     format!("Could not restore plot profile '{}': {}", active, err);
             }
+        }
+        if let Some(msg) = settings_load_error {
+            controller.status_message = msg;
         }
         controller
     }

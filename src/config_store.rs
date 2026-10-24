@@ -497,9 +497,27 @@ impl ConfigStore {
                 path: self.path.display().to_string(),
                 source,
             })?;
-        fs::write(&self.path, serialized).map_err(|source| ConfigError::Io {
+        write_atomic(&self.path, serialized.as_bytes()).map_err(|source| ConfigError::Io {
             path: self.path.display().to_string(),
             source,
         })
     }
+}
+
+/// Writes `bytes` to `path` atomically: the data goes to a sibling `<file>.tmp`, is flushed to
+/// disk, and is then renamed over the destination, so an interrupted save never truncates the
+/// previous file. Shared by the settings store and the plot-profile store.
+pub fn write_atomic(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    use std::io::Write;
+    let tmp_path = path.with_extension("tmp");
+    let result = (|| {
+        let mut file = fs::File::create(&tmp_path)?;
+        file.write_all(bytes)?;
+        file.sync_all()?;
+        fs::rename(&tmp_path, path)
+    })();
+    if result.is_err() {
+        let _ = fs::remove_file(&tmp_path);
+    }
+    result
 }

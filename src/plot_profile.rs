@@ -13,7 +13,7 @@
 //! the unresolved names via [`PlotProfile::unresolved_signals`] instead of discarding them.
 
 use crate::a2l::model::A2lModel;
-use crate::config_store::{EgoVehicleSettings, XyDrawStyle, XyPlotLayerConfig};
+use crate::config_store::{write_atomic, EgoVehicleSettings, XyDrawStyle, XyPlotLayerConfig};
 use crate::recording::file_namer::sanitize_prefix;
 use crate::recording::video_recorder::PlaneViewport;
 use crate::ui::time_plot_tab::MAX_TIME_PLOT_SIGNALS;
@@ -423,17 +423,9 @@ impl ProfileStore {
                 source,
             })?;
 
-        let tmp_path = path.with_extension("tmp");
-        fs::write(&tmp_path, serialized).map_err(|source| ProfileError::Io {
-            path: tmp_path.display().to_string(),
+        write_atomic(path, serialized.as_bytes()).map_err(|source| ProfileError::Io {
+            path: path.display().to_string(),
             source,
-        })?;
-        fs::rename(&tmp_path, path).map_err(|source| {
-            let _ = fs::remove_file(&tmp_path);
-            ProfileError::Io {
-                path: path.display().to_string(),
-                source,
-            }
         })
     }
 
