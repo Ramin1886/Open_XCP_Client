@@ -600,14 +600,17 @@ async fn test_remaining_config_client_validator_and_worker_branches() {
         .submit_calibration_on_enter("Cal.Controller.kp_gain")
         .is_err());
 
-    // Load A2L while disconnected and submit calibration offline
+    // Load A2L while disconnected and submit calibration offline: refused, not faked as Synced
     ctrl.a2l_model = Some(model.clone());
     ctrl.add_calibration_variable("Cal.Controller.kp_gain");
     ctrl.calibration_manager
         .update_input_buffer("Cal.Controller.kp_gain", "2.25".to_string());
-    ctrl.submit_calibration_on_enter("Cal.Controller.kp_gain")
-        .unwrap();
-    assert!(ctrl.status_message.contains("Sent calibration update"));
+    let offline = ctrl
+        .submit_calibration_on_enter("Cal.Controller.kp_gain")
+        .expect_err("offline submit must not report success");
+    assert!(offline.contains("not connected"), "{offline}");
+    assert!(ctrl.status_message.contains("was not written"));
+    assert!(!ctrl.status_message.contains("Sent calibration update"));
 
     // Connect with built-in mock server over TCP + broken local A2L fallback -> triggers A2L parse error
     let broken_a2l = dir.path().join("broken.a2l");

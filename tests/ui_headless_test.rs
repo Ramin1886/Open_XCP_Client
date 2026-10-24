@@ -52,10 +52,15 @@ fn test_headless_ui_tabs_and_settings_menu_rendering() {
     app.controller
         .calibration_manager
         .update_input_buffer("Cal.Controller.kp_gain", "8.25".to_string());
-    app.controller.connected = false; // offline preview commit
+    app.controller.connected = false; // offline: nothing may be written or shown as synced
     assert!(app
         .controller
         .submit_calibration_on_enter("Cal.Controller.kp_gain")
-        .is_ok());
+        .is_err());
+    assert!(
+        app.controller.status_message.contains("Not connected"),
+        "status: {}",
+        app.controller.status_message
+    );
     assert!(app.controller.save_settings().is_ok());
 }

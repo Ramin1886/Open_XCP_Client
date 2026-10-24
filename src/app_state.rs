@@ -1153,16 +1153,21 @@ impl AppController {
         };
         match self.calibration_manager.prepare_write_on_enter(name, model) {
             Ok((characteristic, raw_bytes)) => {
-                if self.connected {
-                    let _ = self.cmd_tx.send(WorkerCommand::WriteCharacteristic {
-                        characteristic,
-                        raw_bytes,
-                        verify_readback: self.settings.calibration.verify_readback,
-                    });
-                } else {
-                    self.calibration_manager
-                        .mark_synced_with_raw(name, model, &raw_bytes);
+                if !self.connected {
+                    // Nothing was written: say so instead of showing the entry as Synced.
+                    self.calibration_manager.mark_error(
+                        name,
+                        "Not connected: value not written to the target".to_string(),
+                    );
+                    self.status_message =
+                        format!("Not connected: '{}' was not written to the target", name);
+                    return Err(format!("not connected: '{name}' was not written"));
                 }
+                let _ = self.cmd_tx.send(WorkerCommand::WriteCharacteristic {
+                    characteristic,
+                    raw_bytes,
+                    verify_readback: self.settings.calibration.verify_readback,
+                });
                 self.status_message = format!("Sent calibration update for '{}'", name);
                 Ok(())
             }
