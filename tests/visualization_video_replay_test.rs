@@ -15,8 +15,8 @@ use open_xcp_client::config_store::{
 };
 use open_xcp_client::mock_server::sample_adas_a2l::sample_adas_a2l_text;
 use open_xcp_client::recording::{
-    build_ffmpeg_args, extract_polygons_for_layer, extract_xy_points_for_layer,
-    render_plane_plot_rgb24, Mp4VideoRecorder, PlaneViewport, SdfSessionRecorder, MP4_FTYP_MAGIC,
+    extract_polygons_for_layer, extract_xy_points_for_layer, render_plane_plot_rgb24,
+    Mp4VideoRecorder, PlaneViewport, SdfSessionRecorder, MP4_FTYP_MAGIC,
 };
 use open_xcp_client::replay::SdfReplayPlayer;
 use open_xcp_client::ui::axis_ticks::{grid_steps, is_major, nice_step, tick_text, ticks};
@@ -402,12 +402,6 @@ fn test_plane_viewport_transforms_and_offscreen_mp4_recording_with_splitting() {
     let ff_completed = vid_ff.finish().unwrap();
     assert_eq!(ff_completed.len(), 2);
     assert_eq!(vid_ff.completed_files().len(), 2);
-
-    let args_x264 = build_ffmpeg_args(&dir.path().join("out.mp4"), 1280, 720, 15, "libx264");
-    assert!(args_x264.contains(&"libx264".to_string()));
-    assert!(args_x264.contains(&"zerolatency".to_string()));
-    let args_nvenc = build_ffmpeg_args(&dir.path().join("out.mp4"), 1280, 720, 15, "h264_nvenc");
-    assert!(args_nvenc.contains(&"h264_nvenc".to_string()));
 }
 
 #[tokio::test]

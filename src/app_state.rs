@@ -56,12 +56,6 @@ pub enum ActiveTab {
     XcpInfo,
 }
 
-impl ActiveTab {
-    /// Alias for backwards compatibility with v0.1 tests.
-    #[allow(non_upper_case_globals)]
-    pub const Logging: Self = Self::Numerical;
-}
-
 /// Per-event runtime DAQ telemetry displayed in the `XCP Info` tab.
 #[derive(Debug, Clone)]
 pub struct EventRuntimeStats {

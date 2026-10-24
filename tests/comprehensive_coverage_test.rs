@@ -154,7 +154,7 @@ fn test_ui_all_states_and_interactions_headless() {
     let mut app = OpenXcpClientApp::new(controller);
     let ctx = egui::Context::default();
 
-    app.controller.active_tab = ActiveTab::Logging;
+    app.controller.active_tab = ActiveTab::Numerical;
     let _ = ctx.run(egui::RawInput::default(), |ctx| {
         app.render_frame(ctx);
     });
@@ -231,7 +231,7 @@ fn test_ui_all_states_and_interactions_headless() {
         e.status = CalibrationSyncStatus::Error("Out of bounds".to_string());
     }
 
-    app.controller.active_tab = ActiveTab::Logging;
+    app.controller.active_tab = ActiveTab::Numerical;
     let _ = ctx.run(egui::RawInput::default(), |ctx| {
         app.render_frame(ctx);
     });

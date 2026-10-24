@@ -28,7 +28,7 @@ fn test_headless_ui_tabs_and_settings_menu_rendering() {
     let ctx = egui::Context::default();
 
     // Frame 1: Render Logging Tab + Open Settings Menu modal
-    app.controller.active_tab = ActiveTab::Logging;
+    app.controller.active_tab = ActiveTab::Numerical;
     app.controller.settings_menu_open = true;
     let _ = ctx.run(egui::RawInput::default(), |ctx| {
         app.render_frame(ctx);

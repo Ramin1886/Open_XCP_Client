@@ -33,7 +33,7 @@ fn test_recording_file_namer_preserves_start_timestamp_across_parts() {
 
 #[test]
 fn test_size_splitter_default_500mb_and_custom_thresholds() {
-    let splitter_500 = SizeSplitter::from_max_mb(500, 8192);
+    let splitter_500 = SizeSplitter::from_max_bytes(500_000_000, 8192);
     assert_eq!(splitter_500.max_file_size_bytes(), 500_000_000);
     assert!(!splitter_500.should_split_before_adding(1024));
 
