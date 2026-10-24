@@ -8,7 +8,9 @@
 //! a single ODT was planned with more than 255 one-byte entries.
 
 use open_xcp_client::a2l::model::{A2lDataType, A2lEvent, A2lModel, Measurement};
-use open_xcp_client::xcp::daq_planner::{DaqPlanner, MAX_ODTS_PER_DAQ_LIST, MAX_ODT_ENTRIES};
+use open_xcp_client::xcp::daq_planner::{
+    DaqPlanner, MAX_DAQ_LISTS, MAX_ODTS_PER_DAQ_LIST, MAX_ODT_ENTRIES,
+};
 
 /// Builds a model with `count` one-byte scalar measurements on a single event channel.
 fn model_with_byte_measurements(count: usize) -> A2lModel {
@@ -123,8 +125,8 @@ fn test_first_odt_reserves_room_for_the_daq_timestamp() {
 
 #[test]
 fn test_measurements_beyond_the_odt_ceiling_are_dropped_not_truncated() {
-    // A 16-byte payload allows 12 data bytes in ODT 0 and 16 afterwards, so 255 ODTs hold
-    // far fewer than 8000 one-byte measurements: the remainder must be reported as dropped
+    // A 16-byte payload allows 12 data bytes in ODT 0 and 16 afterwards, so the ODT ceiling
+    // holds far fewer than 8000 one-byte measurements: the remainder must be reported as dropped
     // rather than silently folded into a malformed allocation.
     let model = model_with_byte_measurements(8000);
     let planner = DaqPlanner::from_a2l(&model, 16);
@@ -214,4 +216,68 @@ fn test_large_arrays_are_chunked_without_exceeding_limits() {
         *offsets.last().unwrap() < total,
         "the last chunk must start inside the array"
     );
+}
+
+#[test]
+fn test_odt_numbers_stay_clear_of_reserved_packet_ids() {
+    // With absolute ODT numbering the ODT number doubles as the DTO packet identifier, and
+    // 0xFC..=0xFF are reserved for SERV / EV / ERR / RES. A full list must therefore stop at 251.
+    let model = model_with_byte_measurements(8000);
+    let planner = DaqPlanner::from_a2l(&model, 16);
+    let list = &planner.lists[0];
+    assert_eq!(list.odts.len(), MAX_ODTS_PER_DAQ_LIST);
+    for odt in &list.odts {
+        assert!(
+            odt.odt_num < 0xFC,
+            "ODT number {} collides with a reserved packet identifier",
+            odt.odt_num
+        );
+    }
+}
+
+#[test]
+fn test_event_channels_beyond_256_lists_are_reported_dropped_not_aliased() {
+    // The DTO header names the DAQ list in one byte, so a 300-event A2L cannot be fully
+    // acquired: lists 0..=255 are planned and the remaining channels are reported as dropped.
+    let mut model = A2lModel {
+        project_name: "ManyEvents".to_string(),
+        module_name: "ManyEvents".to_string(),
+        ..A2lModel::default()
+    };
+    for ev in 0..300u16 {
+        model.events.insert(
+            ev,
+            A2lEvent {
+                channel_id: ev,
+                name: format!("Ev_{ev}"),
+                short_name: format!("E{ev}"),
+                cycle_time_us: 10_000,
+            },
+        );
+        model.measurements.push(Measurement {
+            name: format!("Sig_{ev}"),
+            description: String::new(),
+            data_type: A2lDataType::UByte,
+            compu_method: "NO_COMPU_METHOD".to_string(),
+            lower_limit: 0.0,
+            upper_limit: 255.0,
+            address: 0x7000_0000 + ev as u32,
+            address_extension: 0,
+            matrix_dim: Vec::new(),
+            unit: "-".to_string(),
+            event_id: Some(ev),
+        });
+    }
+    let planner = DaqPlanner::from_a2l(&model, 256);
+    assert_eq!(planner.lists.len(), MAX_DAQ_LISTS);
+    assert!(planner
+        .lists
+        .iter()
+        .all(|l| usize::from(l.daq_list_num as u8) == l.daq_list_num as usize));
+    let dropped = planner.dropped_measurement_indices();
+    assert_eq!(dropped.len(), 300 - MAX_DAQ_LISTS);
+    assert!(dropped
+        .iter()
+        .all(|&i| model.measurements[i].event_id.unwrap() >= 256));
+    assert_eq!(planner.total_odt_entries(), MAX_DAQ_LISTS);
 }

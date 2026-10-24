@@ -17,7 +17,7 @@ pub enum InvariantName {
     NoUnwrapInSrc,
     /// `Cargo.toml` version equals the `open_xcp_client` entry in `Cargo.lock`.
     VersionConsistency,
-    /// `MAX_ODTS_PER_DAQ_LIST` leaves PIDs 0xFC..0xFF free (advisory until fixed).
+    /// `MAX_ODTS_PER_DAQ_LIST` leaves packet identifiers 0xFC..0xFF free.
     ReservedPidLimit,
 }
 
@@ -254,7 +254,7 @@ fn check_reserved_pid(root: &Path) -> DevtoolResult<InvariantResult> {
     };
     Ok(InvariantResult {
         name: InvariantName::ReservedPidLimit,
-        severity: Severity::Warning,
+        severity: Severity::Error,
         pass,
         violations: if pass {
             Vec::new()
