@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: GPL-2.0-only
-//! `open_xcp_client` — Lightweight, high-performance XCP on Ethernet (UDP/TCP)
-//! logging (`.sdf`/HDF5) and live calibration client for Vector `xcplite` 2.2.2 targets.
+//! `open_xcp_client` — Lightweight XCP on Ethernet (UDP/TCP) measurement logging (`.sdf`
+//! container) and live calibration client for Vector `xcplite` 2.2.2 targets.
+//!
+//! Known limitations and the prioritised backlog are tracked in `docs/TODO.md`.
 
 pub mod a2l;
 pub mod app_state;

@@ -3,11 +3,12 @@
 name = "open_xcp_client"
 version = "0.2.0"
 edition = "2021"
+rust-version = "1.87"
 license = "GPL-2.0-only"
-description = "Lightweight, high-performance XCP on Ethernet (UDP/TCP) logging (.sdf/HDF5) and calibration client for XCPlite targets"
+description = "Lightweight XCP on Ethernet (UDP/TCP) measurement logging (.sdf) and calibration client for XCPlite targets"
 repository = "https://github.com/Ramin1886/Open_XCP_Client"
 readme = "README.md"
-keywords = ["xcp", "a2l", "adas", "calibration", "hdf5"]
+keywords = ["xcp", "a2l", "adas", "calibration", "measurement"]
 categories = ["science", "embedded", "network-programming", "gui"]
 
 [lib]
@@ -37,3 +38,7 @@ lto = "thin"
 codegen-units = 1
 strip = true
 panic = "abort"
+
+[workspace]
+members = [".", "tools/xcp_devtool"]
+resolver = "2"

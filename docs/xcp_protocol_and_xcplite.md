@@ -24,7 +24,7 @@ When the embedded ADAS software initializes on QNX 7.1, `xcplite` 2.2.2 generate
 2. [`XcpClient::fetch_a2l`](../src/xcp/client.rs) sends `GET_ID (0xFA, IDT_ASAM_UPLOAD = 4)`.
 3. `xcplite` 2.2.2 sets its internal Memory Transfer Address (MTA) to the generated A2L buffer and returns the total byte length in `res[3..7]`.
 4. The client streams the entire A2L content using chunked `UPLOAD (0xF5)` commands and feeds it directly to [`parse_a2l`](../src/a2l/parser.rs).
-5. If a target is configured to return only a filename (`IDT_ASAM_NAME = 1`) or if the user specifies a **Local A2L Fallback Path** in the **`⚙ Settings`** menu, the client seamlessly loads the fallback `.a2l` file.
+5. If the user specifies a **Local A2L Fallback Path** in the **`⚙ Settings`** menu, the client reads that `.a2l` file **instead of** uploading from the target (the local file wins even when the upload would succeed; `TODO.md` T-08 tracks making it a true fallback). The client never requests `IDT_ASAM_NAME`.
 
 ---
 

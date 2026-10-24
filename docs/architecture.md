@@ -23,7 +23,7 @@ flowchart TB
         XcpClient["XCP Master Client\n(src/xcp/client.rs)"]
         Transport["Async UDP/TCP Demux\n(src/xcp/transport.rs)"]
         DaqPlanner["DAQ ODT Unpacker\n(src/xcp/daq_planner.rs)"]
-        SdfRecorder["HDF5 .sdf Session Recorder\n(src/recording/sdf_writer.rs)"]
+        SdfRecorder[".sdf Container Session Recorder\n(src/recording/sdf_writer.rs)"]
         Mp4Recorder["Offscreen 2D .mp4 Video Recorder\n(src/recording/video_recorder.rs)"]
     end
 
@@ -46,12 +46,12 @@ flowchart TB
    - Zero-copy lexical scanner ([`lexer.rs`](../src/a2l/lexer.rs)) avoids unnecessary heap allocations when tokenizing multi-megabyte A2L files.
    - Recursive structure expander ([`struct_resolver.rs`](../src/a2l/struct_resolver.rs)) flattens `INSTANCE` / `TYPEDEF_STRUCTURE` trees into concrete memory addresses while preserving the nested hierarchy in `StructTreeNode`.
 3. **XCP Layer ([`src/xcp/`](../src/xcp/mod.rs))**:
-   - Single-threaded `tokio` runtime handles non-blocking UDP/TCP I/O ([`transport.rs`](../src/xcp/transport.rs)).
+   - Single-threaded `tokio` runtime handles non-blocking UDP/TCP I/O ([`transport.rs`](../src/xcp/transport.rs)). Recording and video rasterisation currently run on the same thread, so a large part flush can stall socket reads (`TODO.md` T-05).
    - Incoming packets are immediately split into two dedicated queues:
      - `cto_rx` for command responses (`0xFF` / `0xFE`), enabling sub-millisecond calibration reads/writes.
      - `daq_rx` for streaming DTO DAQ packets (`0x00..=0xFB`), processed continuously for both live monitoring and `.sdf` + `.mp4` recording.
 4. **Recording & Replay Layer ([`src/recording/`](../src/recording/mod.rs) & [`src/replay/`](../src/replay/mod.rs))**:
-   - Accumulates time-correlated samples per XCP Event channel into HDF5 v2 `.sdf` files while rendering the 2D XY Plot offscreen into `.mp4` (H.264 / ISO BMFF) video files, rotating both in lockstep before exceeding `max_logfile_size_mb`.
+   - Accumulates time-correlated samples per XCP Event channel into `.sdf` container files (HDF5 signature plus an embedded JSON index; not readable by generic HDF5 tools, see `TODO.md` T-02) while rendering the 2D XY Plot offscreen into `.mp4`-named RLE frame-stream files (not H.264, T-01), rotating both in lockstep before exceeding `max_logfile_size_mb`. The whole current part is held in memory until it rotates or recording stops (T-03).
    - [`SdfReplayPlayer`](../src/replay/mod.rs) loads one or multiple `.sdf` part files for offline playback and time-slider seeking.
 5. **UI Layer ([`src/ui/`](../src/ui/mod.rs))**:
    - Uses `egui`/`eframe` across 5 focused tabs (`2D Live Plot`, `Numerical`, `Time Plot`, `Calibration`, `XCP Info`), capping background repaints to ~30 Hz during active streaming/recording to keep laptop CPU and GPU usage minimal.
@@ -60,4 +60,4 @@ flowchart TB
 
 ## Next Steps
 - [XCP Protocol & Vector `xcplite` 2.2.2 Integration →](./xcp_protocol_and_xcplite.md)
-- [HDF5-Based `.sdf` & `.mp4` Video Recording →](./sdf_file_format.md)
+- [`.sdf` Container & `.mp4` Frame-Stream Recording →](./sdf_file_format.md)
