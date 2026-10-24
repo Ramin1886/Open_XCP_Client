@@ -11,7 +11,7 @@ paths:
 
 - Tests live in `tests/*_test.rs` (integration style). There are no `#[cfg(test)]` modules in `src/`; keep it that way.
 - A test is named after the behaviour it proves and asserts an observable outcome: a value, an error variant, a file's content, a state change. Calling a function and asserting nothing is not a test.
-- Async outcomes are awaited with a poll-until-deadline loop (see `tests/end_to_end_xcp_test.rs`), never `sleep(ms)` then assert.
+- Async outcomes are awaited with `common::wait_until` / `common::wait_until_async` from `tests/common/mod.rs` (poll-until-deadline), never `sleep(ms)` then assert. Add `mod common;` to the test file.
 - Network tests use `MockXcpServer::start(0)` (ephemeral ports). Never bind a fixed port, never connect to a port you expect to be closed.
 - File tests use `tempfile`; never write into `config/` or `logfile/`.
 - Error branches are covered by feeding malformed input (truncated frames, bad A2L, short `.sdf`), not by `#[should_panic]`.

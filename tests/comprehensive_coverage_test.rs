@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: GPL-2.0-only
-//! Comprehensive branch and edge-case tests across `config_store`, `a2l`, `xcp`,
-//! `recording`, `calibration`, `mock_server`, `app_state`, and `ui` to guarantee >=95% line coverage.
+//! Error-branch and edge-case behaviour tests across `config_store`, `a2l`, `xcp`, `recording`,
+//! `calibration`, `mock_server`, `app_state` and `ui`.
+
+mod common;
 
 use chrono::Utc;
 use open_xcp_client::a2l::model::A2lModel;
@@ -302,29 +304,47 @@ async fn test_app_controller_worker_all_events_and_error_paths() {
 
     // 1. Start recording when not connected -> emits StatusMessage
     controller.toggle_recording();
-    std::thread::sleep(Duration::from_millis(30));
-    controller.poll_worker_events();
-    assert!(controller
-        .status_message
-        .contains("Connect to an XCP target"));
+    assert!(
+        common::wait_until_async(&mut controller, Duration::from_secs(2), |c| {
+            c.status_message.contains("Connect to an XCP target")
+        })
+        .await,
+        "status: {}",
+        controller.status_message
+    );
 
     // 2. Connect with invalid IP address -> emits Disconnected
     controller.settings.ui.enable_mock_server = false;
     controller.settings.connection.target_ip = "not_an_ip_address".to_string();
     controller.request_connect();
-    std::thread::sleep(Duration::from_millis(30));
-    controller.poll_worker_events();
-    assert!(controller.status_message.contains("Invalid target IP/port"));
+    assert!(
+        common::wait_until_async(&mut controller, Duration::from_secs(2), |c| {
+            c.status_message.contains("Invalid target IP/port")
+        })
+        .await,
+        "status: {}",
+        controller.status_message
+    );
 
-    // 2b. Connect to closed TCP port -> emits XCP connection failed
+    // 2b. A TCP endpoint that accepts the connection but never answers CONNECT: the command
+    //     times out and the worker reports "XCP connection failed". (A listener we own is
+    //     deterministic; a port assumed closed is not, see .agents/rules/testing.md.)
+    let silent_listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
     controller.settings.connection.target_ip = "127.0.0.1".to_string();
-    controller.settings.connection.target_port = 1;
+    controller.settings.connection.target_port = silent_listener.local_addr().unwrap().port();
     controller.settings.connection.transport = TransportProtocol::Tcp;
     controller.settings.connection.connect_timeout_ms = 200;
     controller.request_connect();
-    tokio::time::sleep(Duration::from_millis(80)).await;
-    controller.poll_worker_events();
-    assert!(controller.status_message.contains("XCP connection failed"));
+    assert!(
+        common::wait_until_async(&mut controller, Duration::from_secs(3), |c| {
+            c.status_message.contains("XCP connection failed")
+        })
+        .await,
+        "status: {}",
+        controller.status_message
+    );
+    assert!(!controller.connected);
+    drop(silent_listener);
 
     // 3. Connect to real MockXcpServer via explicit IP/port (enable_mock_server = false)
     let srv = MockXcpServer::start(0).await.unwrap();
@@ -336,12 +356,16 @@ async fn test_app_controller_worker_all_events_and_error_paths() {
     controller.settings.connection.local_a2l_fallback_path = fallback_file.display().to_string();
     controller.request_connect();
 
-    let wait = std::time::Instant::now();
-    while !controller.connected && wait.elapsed() < Duration::from_secs(2) {
-        controller.poll_worker_events();
-        tokio::time::sleep(Duration::from_millis(15)).await;
-    }
-    assert!(controller.connected);
+    assert!(
+        common::wait_until_async(&mut controller, Duration::from_secs(3), |c| c.connected).await,
+        "status: {}",
+        controller.status_message
+    );
+    // The A2L the controller works with is the one the sample describes.
+    assert_eq!(
+        controller.a2l_model.as_ref().map(|m| m.measurements.len()),
+        Some(model.measurements.len())
+    );
 
     // Send SetCalPage command through worker
     controller.send_worker_command(WorkerCommand::SetCalPage { page: 1 });
@@ -351,11 +375,16 @@ async fn test_app_controller_worker_all_events_and_error_paths() {
         prefix: "Measurement".to_string(),
         max_size_bytes: 500_000_000,
     });
-    tokio::time::sleep(Duration::from_millis(40)).await;
-    controller.poll_worker_events();
-    assert!(controller
-        .status_message
-        .contains("Failed to initialize SDF recorder"));
+    assert!(
+        common::wait_until_async(&mut controller, Duration::from_secs(3), |c| {
+            c.status_message
+                .contains("Failed to initialize SDF recorder")
+        })
+        .await,
+        "status: {}",
+        controller.status_message
+    );
+    assert!(!controller.is_recording);
 
     // Exercise all remaining WorkerEvent branches directly on handle_worker_event
     controller.add_calibration_variable("Cal.Controller.kp_gain");
@@ -427,22 +456,58 @@ async fn test_app_controller_worker_all_events_and_error_paths() {
     raw_sdf[len - 1] ^= 0xFF; // corrupt trailer magic
     assert!(SdfFileReader::from_bytes(raw_sdf).is_err());
 
-    // Start recording, then reconnect while recording is active to exercise cleanup on reconnect
+    // Start recording, then reconnect while recording is active: the worker must finalize the
+    // open part and report it, so the UI never stays on "REC" across a reconnect.
     controller.log_folder_input = dir.path().display().to_string();
+    // Distinct prefixes per recording: parts started within the same second would otherwise
+    // share a filename (docs/TODO.md T-30) and the path comparison below would prove nothing.
+    controller.log_prefix_input = "ReconnectWhileRecording".to_string();
     controller.toggle_recording();
-    tokio::time::sleep(Duration::from_millis(40)).await;
-    controller.poll_worker_events();
+    assert!(
+        common::wait_until_async(&mut controller, Duration::from_secs(3), |c| {
+            c.is_recording && c.total_samples_recorded >= 2
+        })
+        .await
+    );
+    // RecordingStopped replaces the completed-files list, so compare the last path, not the length.
+    let previous_part = controller.completed_files.last().cloned();
     controller.request_connect();
-    tokio::time::sleep(Duration::from_millis(60)).await;
-    controller.poll_worker_events();
+    assert!(
+        common::wait_until_async(&mut controller, Duration::from_secs(3), |c| {
+            c.connected && !c.is_recording && c.completed_files.last() != previous_part.as_ref()
+        })
+        .await,
+        "reconnect must finalize the recording; status: {}",
+        controller.status_message
+    );
+    assert!(controller.completed_files.last().unwrap().exists());
 
-    // Start recording again and disconnect while recording is active
+    // Start recording again and disconnect while recording is active: same guarantee.
+    controller.log_prefix_input = "DisconnectWhileRecording".to_string();
     controller.toggle_recording();
-    tokio::time::sleep(Duration::from_millis(40)).await;
+    assert!(
+        common::wait_until_async(&mut controller, Duration::from_secs(3), |c| {
+            c.is_recording && c.total_samples_recorded >= 2
+        })
+        .await
+    );
+    let previous_part = controller.completed_files.last().cloned();
     controller.request_disconnect();
-    tokio::time::sleep(Duration::from_millis(40)).await;
-    controller.poll_worker_events();
-    let _ = model;
+    assert!(
+        common::wait_until_async(&mut controller, Duration::from_secs(3), |c| !c.connected).await
+    );
+    assert!(!controller.is_recording);
+    assert_ne!(controller.completed_files.last(), previous_part.as_ref());
+    assert!(controller
+        .completed_files
+        .last()
+        .unwrap()
+        .to_string_lossy()
+        .contains("DisconnectWhileRecording"));
+    assert!(controller
+        .completed_files
+        .iter()
+        .all(|p| p.exists() && p.extension().is_some_and(|e| e == "sdf")));
     srv.stop();
 }
 
@@ -551,9 +616,14 @@ async fn test_remaining_config_client_validator_and_worker_branches() {
     ctrl.settings.connection.transport = TransportProtocol::Tcp;
     ctrl.settings.connection.local_a2l_fallback_path = broken_a2l.display().to_string();
     ctrl.request_connect();
-    tokio::time::sleep(Duration::from_millis(80)).await;
-    ctrl.poll_worker_events();
-    assert!(ctrl.status_message.contains("A2L parse error"));
+    assert!(
+        common::wait_until_async(&mut ctrl, Duration::from_secs(3), |c| {
+            c.status_message.contains("A2L parse error")
+        })
+        .await,
+        "status: {}",
+        ctrl.status_message
+    );
 
     // 5. A2L parser short/malformed block guards, event time units, and typedef/instance keyword branches
     assert!(parse_a2l("/begin").is_err());

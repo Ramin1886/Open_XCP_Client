@@ -2,30 +2,15 @@
 //! Recording I/O failures must stop the recording visibly instead of leaving the UI on "REC"
 //! while samples vanish, and must never take the live DAQ link down with them.
 
+mod common;
+
+use common::wait_until;
 use open_xcp_client::app_state::{AppController, WorkerCommand};
 use open_xcp_client::config_store::ConfigStore;
 use open_xcp_client::ui::OpenXcpClientApp;
 use std::path::Path;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 use tempfile::tempdir;
-
-fn wait_until(
-    ctrl: &mut AppController,
-    timeout: Duration,
-    pred: impl Fn(&AppController) -> bool,
-) -> bool {
-    let deadline = Instant::now() + timeout;
-    loop {
-        ctrl.poll_worker_events();
-        if pred(ctrl) {
-            return true;
-        }
-        if Instant::now() >= deadline {
-            return false;
-        }
-        std::thread::sleep(Duration::from_millis(10));
-    }
-}
 
 fn connected_controller(dir: &Path, rec_dir: &Path) -> AppController {
     let store = ConfigStore::new(dir.join("settings.json"));
