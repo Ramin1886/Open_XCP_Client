@@ -2,12 +2,14 @@
 //! Main `eframe::App` GUI implementation integrating the Top Bar (`Live`/`Replay` switch,
 //! Live Recording Bar, `.sdf` Replay Bar, 5-tab selector), Settings Menu modal,
 //! `2D Live Plot` Tab, `Numerical` Tab, `Time Plot` Tab, `Calibration` Tab, `XCP Info` Tab,
+//! reusable Plot Profile selector,
 //! and Status Footer.
 
 pub mod axis_ticks;
 pub mod calibration_tab;
 pub mod numerical_tab;
 pub mod plane_plot_tab;
+pub mod profile_panel;
 pub mod settings_menu;
 pub mod theme;
 pub mod time_plot_tab;

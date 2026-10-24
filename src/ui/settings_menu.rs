@@ -3,10 +3,11 @@
 //! Target Connection (IP, Port, UDP/TCP, local A2L fallback, Mock server),
 //! Recording & Logfile/Video Split Size (default 500 MB), 2D Video Recording options,
 //! Ego Vehicle dimensions (`length_m`, `width_m`, `rear_axle_to_center_m`),
-//! and Calibration options, persisted in `./config/settings.json`.
+//! Calibration options, and the Plot Profile selector, persisted in `./config/settings.json`.
 
 use crate::app_state::AppController;
 use crate::config_store::{AppSettings, TransportProtocol};
+use crate::ui::profile_panel::render_profile_section;
 use egui::{Context, RichText, Ui};
 
 /// Renders the Settings Menu modal window when `controller.settings_menu_open == true`.
@@ -30,6 +31,14 @@ pub fn render_settings_menu(ctx: &Context, controller: &mut AppController) {
 
 /// Renders the inner form of the Settings Menu (also callable directly in headless UI tests).
 pub fn render_settings_contents(ui: &mut Ui, controller: &mut AppController) {
+    ui.heading(RichText::new("Plot Profiles (Predefined Measurement Views)").strong());
+    ui.weak(
+        "A profile stores the 2D (X, Y) layers, Time Plot selection, Ego geometry, viewport and \
+         calibration watch-list as one .json file in ./config/profiles/ for reuse across sessions.",
+    );
+    render_profile_section(ui, controller);
+
+    ui.separator();
     ui.heading(RichText::new("Target XCP Connection").strong());
     egui::Grid::new("settings_conn_grid")
         .num_columns(2)

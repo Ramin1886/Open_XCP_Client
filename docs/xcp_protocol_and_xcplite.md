@@ -41,6 +41,39 @@ Implemented in [`src/xcp/daq_planner.rs`](../src/xcp/daq_planner.rs) and [`XcpCl
 3. Each measurement's memory address (`ECU_ADDRESS`), extension (`ECU_ADDRESS_EXTENSION`), and byte size are written into ODT entries via `SET_DAQ_PTR (0xE2)` + `WRITE_DAQ (0xE1)`.
 4. Each DAQ list is bound to its A2L `EVENT` channel with timestamping enabled (`SET_DAQ_LIST_MODE (0xE0, mode = 0x10)`), selected via `START_STOP_DAQ_LIST (0xDE, mode = 0x02)`, and started synchronously via `START_STOP_SYNCH (0xDD, mode = 0x01)`.
 
+DAQ is configured once, on connect, and runs until disconnect. Starting or stopping a recording
+is purely host-side and never re-allocates DAQ — re-running the allocation would tear down a
+working configuration, and some slaves reject the re-allocation outright.
+
+### ODT packing limits
+
+`ALLOC_ODT`, `ALLOC_ODT_ENTRY` and `SET_DAQ_PTR` each carry the ODT number and the ODT entry
+number in a **single byte**, so an ODT holds at most `MAX_ODT_ENTRIES = 255` entries and a DAQ
+list at most `MAX_ODTS_PER_DAQ_LIST = 255` ODTs
+([`src/xcp/daq_planner.rs`](../src/xcp/daq_planner.rs)). An ODT is therefore closed when *either*
+the `MAX_DTO` payload is full *or* it already holds 255 entries, and the first ODT of each list
+reserves 4 bytes for the DAQ timestamp the slave prepends to it.
+
+This matters on targets with many small measurements: 1000 one-byte signals fit a 1018-byte
+`MAX_DTO` by size but need four ODTs by entry count. Packing them into one ODT makes the entry
+count wrap in `ALLOC_ODT_ENTRY` and the slave answers `ERR_MEMORY_OVERFLOW (0x22)`, so DAQ never
+starts and no measurement data arrives.
+
+Exactly one DAQ list is planned per event channel, which keeps one `.sdf` timestamp row per event
+firing. On a target with a small `MAX_DTO` and a very large event, the 255-ODT ceiling can be
+reached; the measurements beyond it are then reported through
+`DaqPlanner::dropped_measurement_indices` and named in the status bar rather than being folded
+into a malformed allocation.
+
+### Diagnosing "connected but no data"
+
+A DAQ setup that the slave rejects is reported in the status bar immediately after connect, so
+`Connected — Live DAQ streaming` never stands alone when the allocation actually failed. If DAQ
+starts cleanly and still no DTO arrives, the target application is not triggering its XCP events
+— check that the target's `xcplite` integration actually registers and fires them (a target that
+logs `No xcp_evts section found` at startup serves its A2L and answers every CTO command, but
+never produces DAQ data).
+
 ---
 
 ## Target Clock Correlation to UTC (`src/xcp/clock_sync.rs`)

@@ -20,6 +20,10 @@
 # Local runtime user settings (keep settings.default.json tracked)
 /config/settings.json
 
+# User-defined plot profiles (keep .gitkeep and README.md tracked)
+/config/profiles/*.json
+/config/profiles/*.tmp
+
 # Test & coverage outputs
 /coverage/
 lcov.info

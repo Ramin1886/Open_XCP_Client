@@ -16,6 +16,7 @@ It is purpose-built for embedded ADAS and automotive software integrating **Vect
 - [Getting Started](#getting-started)
 - [Operator Workflow](#operator-workflow)
 - [Configuration Reference (`settings.json`)](#configuration-reference-settingsjson)
+- [Plot Profiles (Predefined, Reusable Measurement Views)](#plot-profiles-predefined-reusable-measurement-views)
 - [SDF & MP4 File Naming Specification](#sdf--mp4-file-naming-specification)
 - [Codebase Architecture](#codebase-architecture)
 - [Documentation Suite](#documentation-suite)
@@ -125,7 +126,7 @@ The optimized executable is produced at `target/release/open_xcp_client` (or `ta
 ./target/release/open_xcp_client
 
 # Run a headless self-check of configuration, A2L parsing, and SDF recording
-./target/release/open_xcp_client --self-check
+./target/release/open_xcp_client --headless-self-check
 
 # Print version information
 ./target/release/open_xcp_client --version
@@ -184,6 +185,32 @@ Runtime settings are stored in `./config/settings.json` (seeded from [`./config/
 | `calibration.active_cal_page` | `u8` | `0` | Active ECU/XCP calibration page (`0` = Reference, `1` = Working) |
 | `ui.dark_mode` | `bool` | `true` | Enable dark engineering theme |
 | `ui.enable_mock_server` | `bool` | `false` | Spawn built-in simulated QNX ADAS `xcplite` server on Connect |
+| `active_profile` | `string` | `""` | Name of the plot profile in `./config/profiles/` to re-apply on startup |
+
+---
+
+## Plot Profiles (Predefined, Reusable Measurement Views)
+
+A **plot profile** stores one complete measurement view — the 2D `(X, Y)` layers, the Time Plot
+selection and window, the Ego geometry, the 2D viewport framing and the calibration watch-list —
+as a single JSON file in `./config/profiles/<Name>.json`. Define a view once, reload it in the
+next test session, or hand the file to a colleague.
+
+The `Plot Profiles` section appears in **`⚙ Settings`** and, as a collapsed **`📁 Plot Profiles`**
+header, at the top of the **`2D Live Plot`** and **`Time Plot`** sidebars:
+
+- **`💾 Save Current View As Profile`** — write the current view under a name you type
+- **`📂 Load`** / **`🔁 Update`** / **`🗑 Delete`** — apply, overwrite or remove the selected profile
+- **`⤵ Import`** / **`⤴ Export`** — read or write a profile at any path, for sharing
+
+The last profile applied is remembered as `active_profile` in `settings.json` and re-applied
+automatically on the next start. Profiles reference signals by A2L name only, so loading one
+against a target whose A2L lacks some of those signals applies it anyway and flags the unresolved
+names with `⚠` — they are never silently dropped.
+
+Profile files are user data and are gitignored, so no project-specific view ships with the client.
+See the [Plot Profiles guide](./docs/plot_profiles.md) and
+[`config/profiles/README.md`](./config/profiles/README.md) for the full schema.
 
 ---
 
@@ -205,9 +232,10 @@ Each source file in [`./src/`](./src/) is scoped to a single, well-defined respo
 
 | Module / Path | Scope & Responsibility |
 | :--- | :--- |
-| [`src/main.rs`](./src/main.rs) | Native `eframe` application bootstrap and `--self-check` CLI entry point |
+| [`src/main.rs`](./src/main.rs) | Native `eframe` application bootstrap and `--headless-self-check` CLI entry point |
 | [`src/lib.rs`](./src/lib.rs) | Library root exporting all core subsystems |
 | [`src/config_store.rs`](./src/config_store.rs) | JSON configuration persistence (`./config/settings.json`), Ego vehicle geometry, and XY layer schema |
+| [`src/plot_profile.rs`](./src/plot_profile.rs) | Named, reusable plot profiles (`./config/profiles/<Name>.json`), atomic writes, and unresolved-signal detection |
 | [`src/app_state.rs`](./src/app_state.rs) | Application state controller, rolling time-series buffers, and UI $\leftrightarrow$ Worker channel orchestration |
 | [`src/a2l/lexer.rs`](./src/a2l/lexer.rs) | Zero-copy tokenizer for ASAM MCD-2 MC (`A2L`) files |
 | [`src/a2l/parser.rs`](./src/a2l/parser.rs) | Parser for `EVENT`, `MEASUREMENT`, `CHARACTERISTIC`, `RECORD_LAYOUT`, and `TYPEDEF_*` blocks |
@@ -215,7 +243,7 @@ Each source file in [`./src/`](./src/) is scoped to a single, well-defined respo
 | [`src/a2l/compu_method.rs`](./src/a2l/compu_method.rs) | Physical $\leftrightarrow$ raw conversion engine (`IDENTICAL`, `LINEAR`, `RAT_FUNC`, `TAB_VERB`) |
 | [`src/xcp/packet.rs`](./src/xcp/packet.rs) | XCP-on-Ethernet 4-byte header codec, CTO command builders, and DTO decoders |
 | [`src/xcp/transport.rs`](./src/xcp/transport.rs) | Async UDP/TCP socket multiplexer separating CTO responses from DAQ DTO streams |
-| [`src/xcp/daq_planner.rs`](./src/xcp/daq_planner.rs) | Per-event DAQ list/ODT packer and incoming DTO sample decoder |
+| [`src/xcp/daq_planner.rs`](./src/xcp/daq_planner.rs) | Per-event DAQ list/ODT packer (respecting the 255-entry and 255-ODT `u8` limits) and incoming DTO sample decoder |
 | [`src/xcp/clock_sync.rs`](./src/xcp/clock_sync.rs) | Target `GET_DAQ_CLOCK` + 32-bit DTO timestamp rollover tracker and UTC correlator |
 | [`src/xcp/client.rs`](./src/xcp/client.rs) | High-level XCP Master client (connect, A2L upload, DAQ control, concurrent calibration) |
 | [`src/recording/file_namer.rs`](./src/recording/file_namer.rs) | UTC timestamp formatter and sequential `.sdf` / `.mp4` part filename generator |
@@ -227,7 +255,8 @@ Each source file in [`./src/`](./src/) is scoped to a single, well-defined respo
 | [`src/calibration/manager.rs`](./src/calibration/manager.rs) | Calibration Content watch-list state machine and Enter-key submission handler |
 | [`src/ui/axis_ticks.rs`](./src/ui/axis_ticks.rs) | Zoom-adaptive `1-2-5` metric grid step and tick formatter |
 | [`src/ui/top_bar.rs`](./src/ui/top_bar.rs) | Top navigation bar with `Live`/`Replay` switch, 5-tab selector, recording/replay bar, and `⚙ Settings` button |
-| [`src/ui/settings_menu.rs`](./src/ui/settings_menu.rs) | Modal settings dialog for target endpoint, split size (`MB`), video options, and Ego vehicle dimensions |
+| [`src/ui/settings_menu.rs`](./src/ui/settings_menu.rs) | Modal settings dialog for plot profiles, target endpoint, split size (`MB`), video options, and Ego vehicle dimensions |
+| [`src/ui/profile_panel.rs`](./src/ui/profile_panel.rs) | Reusable `Plot Profiles` selector (load/update/delete/save-as/import/export) and unresolved-signal warning |
 | [`src/ui/plane_plot_tab.rs`](./src/ui/plane_plot_tab.rs) | Interactive 2D Live Plot canvas and filterable `(X, Y)` signal pair layer builder |
 | [`src/ui/numerical_tab.rs`](./src/ui/numerical_tab.rs) | Filterable hierarchical numerical signal inspector with 1.0-second change highlighting |
 | [`src/ui/time_plot_tab.rs`](./src/ui/time_plot_tab.rs) | Filterable signal picker and 2-column rolling time-series strip-chart grid |

@@ -7,6 +7,7 @@ use crate::recording::file_namer::RecordingFileNamer;
 use crate::ui::axis_ticks::{grid_steps, is_major, ticks};
 use crate::xcp::daq_planner::DecodedValue;
 use chrono::{DateTime, Utc};
+use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::fs::{self, File};
 use std::io::{BufWriter, Write};
@@ -17,7 +18,7 @@ pub const MP4_FTYP_MAGIC: &[u8; 4] = b"ftyp";
 
 /// Viewport state (world center in meters and scale in pixels-per-meter) shared between
 /// the interactive 2D Live Plot canvas and the offscreen `.mp4` video rasterizer.
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub struct PlaneViewport {
     pub center_x_m: f64,
     pub center_y_m: f64,

@@ -4,7 +4,7 @@
 //! Stores connection settings, recording preferences (including the configurable
 //! logfile and MP4 video split size in MB, defaulting to 500 MB), Ego vehicle geometry,
 //! 2D XY plot signal-pair layers, time-series plot selection, calibration watch-list,
-//! and UI options.
+//! UI options, and the name of the active plot profile (see [`crate::plot_profile`]).
 
 use serde::{Deserialize, Serialize};
 use std::fs;
@@ -375,6 +375,10 @@ pub struct AppSettings {
     pub ui: UiSettings,
     #[serde(default)]
     pub visualization: VisualizationSettings,
+    /// Name of the plot profile (`./config/profiles/<Name>.json`) to re-apply on startup;
+    /// empty when no profile is active.
+    #[serde(default)]
+    pub active_profile: String,
 }
 
 impl AppSettings {
