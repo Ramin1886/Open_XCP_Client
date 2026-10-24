@@ -286,10 +286,10 @@ fn test_sdf_reader_type_mismatch_and_daq_short_packet_edges() {
     let mut planner = DaqPlanner::from_a2l(&model, 128);
     let mut clock = TargetClockSync::new(true);
     assert!(planner
-        .process_dto_packet(0, 0, &[1, 2], &model, &mut clock)
+        .process_dto_packet(0, 0, &[1, 2], 0, &model, &mut clock)
         .is_none());
     assert!(planner
-        .process_dto_packet(0, 0, &[0, 0, 0, 0, 1], &model, &mut clock)
+        .process_dto_packet(0, 0, &[0, 0, 0, 0, 1], 0, &model, &mut clock)
         .is_none());
 }
 

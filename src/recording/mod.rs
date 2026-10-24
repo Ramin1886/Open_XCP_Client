@@ -9,8 +9,8 @@ pub mod video_recorder;
 
 pub use file_namer::{format_utc_for_filename, RecordingFileNamer};
 pub use sdf_writer::{
-    jenkins_lookup3_checksum, SdfDatasetSummary, SdfError, SdfFileReader, SdfSessionRecorder,
-    HDF5_SIGNATURE,
+    jenkins_lookup3_checksum, SdfDatasetSummary, SdfError, SdfFileMetadata, SdfFileReader,
+    SdfGapRecord, SdfIntegritySummary, SdfProvenance, SdfSessionRecorder, HDF5_SIGNATURE,
 };
 pub use size_splitter::SizeSplitter;
 pub use video_recorder::{

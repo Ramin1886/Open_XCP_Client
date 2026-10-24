@@ -151,6 +151,7 @@ fn test_daq_planner_packing_and_dto_decoding() {
             odt.odt_num,
             list0.daq_list_num as u8,
             &dto_payload,
+            0,
             &model,
             &mut clock,
         );

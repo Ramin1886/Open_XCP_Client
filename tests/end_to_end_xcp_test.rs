@@ -103,6 +103,7 @@ async fn run_full_protocol_flow(protocol: TransportProtocol) {
                 dto.odt_num,
                 dto.daq_list_num,
                 &dto.payload,
+                0,
                 &model,
                 &mut clock_sync,
             ) {

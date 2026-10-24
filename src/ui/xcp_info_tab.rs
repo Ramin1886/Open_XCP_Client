@@ -9,7 +9,7 @@
 
 use crate::app_state::{AppController, AppMode};
 use crate::ui::theme::{COLOR_CONNECTED, COLOR_DISCONNECTED, COLOR_RECORDING};
-use egui::{RichText, ScrollArea, Ui};
+use egui::{Color32, RichText, ScrollArea, Ui};
 
 /// Renders the `XCP Info` tab (`ActiveTab::XcpInfo`).
 pub fn render_xcp_info_tab(ui: &mut Ui, controller: &mut AppController) {
@@ -83,6 +83,8 @@ pub fn render_xcp_info_tab(ui: &mut Ui, controller: &mut AppController) {
             });
 
             ui.add_space(8.0);
+            render_link_integrity(ui, controller);
+            ui.add_space(8.0);
 
             // Section 2: Per-Event DAQ Telemetry Table
             ui.group(|ui| {
@@ -94,7 +96,7 @@ pub fn render_xcp_info_tab(ui: &mut Ui, controller: &mut AppController) {
                     ui.label("No XCP Event channels active yet. Connect to target or load an .sdf recording.");
                 } else {
                     egui::Grid::new("xcp_event_telemetry_grid")
-                        .num_columns(8)
+                        .num_columns(11)
                         .spacing([18.0, 6.0])
                         .striped(true)
                         .show(ui, |ui| {
@@ -107,6 +109,9 @@ pub fn render_xcp_info_tab(ui: &mut Ui, controller: &mut AppController) {
                                 "Samples",
                                 "Latest UTC (s)",
                                 "Age (ms)",
+                                "Discarded",
+                                "No ODT 0",
+                                "ODT Seq Err",
                             ] {
                                 ui.label(RichText::new(hdr).strong());
                             }
@@ -116,11 +121,30 @@ pub fn render_xcp_info_tab(ui: &mut Ui, controller: &mut AppController) {
                                 ui.monospace(format!("0x{:04X} ({})", ev.event_channel_id, ev.event_channel_id));
                                 ui.label(RichText::new(&ev.event_name).monospace().strong());
                                 ui.monospace(format!("{:.2}", ev.configured_cycle_ms));
-                                ui.monospace(
-                                    ev.mean_cycle_ms()
-                                        .map(|v| format!("{:.2}", v))
-                                        .unwrap_or_else(|| "—".to_string()),
-                                );
+                                // Flag a measured cycle that has drifted away from the A2L value,
+                                // instead of leaving the comparison to the reader's eye.
+                                match ev.mean_cycle_ms() {
+                                    Some(mean) => {
+                                        let drifted = ev.configured_cycle_ms > 0.0
+                                            && (mean - ev.configured_cycle_ms).abs()
+                                                > ev.configured_cycle_ms
+                                                    * CYCLE_DEVIATION_WARN_FRACTION;
+                                        let text = RichText::new(format!("{:.2}", mean)).monospace();
+                                        ui.label(if drifted {
+                                            text.color(LOSS_WARN_COLOR).strong()
+                                        } else {
+                                            text
+                                        })
+                                        .on_hover_text(if drifted {
+                                            "Measured cycle deviates from the A2L cycle time by more than 25%"
+                                        } else {
+                                            "Measured cycle matches the A2L cycle time"
+                                        });
+                                    }
+                                    None => {
+                                        ui.monospace("—");
+                                    }
+                                }
                                 ui.monospace(
                                     ev.max_cycle_ms()
                                         .map(|v| format!("{:.2}", v))
@@ -137,6 +161,14 @@ pub fn render_xcp_info_tab(ui: &mut Ui, controller: &mut AppController) {
                                         .map(|v| format!("{:.0}", v))
                                         .unwrap_or_else(|| "—".to_string()),
                                 );
+                                let loss = controller
+                                    .event_loss
+                                    .get(&ev.event_channel_id)
+                                    .copied()
+                                    .unwrap_or_default();
+                                loss_cell(ui, loss.cycles_discarded);
+                                loss_cell(ui, loss.cycles_lost_no_header);
+                                loss_cell(ui, loss.odt_sequence_errors);
                                 ui.end_row();
                             }
                         });
@@ -194,4 +226,103 @@ pub fn render_xcp_info_tab(ui: &mut Ui, controller: &mut AppController) {
                 }
             });
         });
+}
+
+/// Amber used for any non-zero loss figure.
+const LOSS_WARN_COLOR: Color32 = Color32::from_rgb(251, 191, 36);
+
+/// Relative deviation between measured and A2L cycle time that earns a warning.
+const CYCLE_DEVIATION_WARN_FRACTION: f64 = 0.25;
+
+/// Renders one integrity count, amber when non-zero so loss cannot be skimmed past.
+fn loss_cell(ui: &mut Ui, value: u64) {
+    let text = RichText::new(format!("{}", value)).monospace();
+    ui.label(if value > 0 {
+        text.color(LOSS_WARN_COLOR).strong()
+    } else {
+        text
+    });
+}
+
+/// Renders the link-integrity section: CTR continuity, queue drops and recent discarded cycles.
+///
+/// Without these figures a dropped UDP datagram is invisible, and a recording taken over a lossy
+/// link is indistinguishable from a complete one.
+pub fn render_link_integrity(ui: &mut Ui, controller: &AppController) {
+    ui.group(|ui| {
+        let clean = controller.daq_integrity_is_clean();
+        ui.horizontal(|ui| {
+            ui.heading(RichText::new("Link & DAQ Integrity").strong());
+            ui.label(if clean {
+                RichText::new("✔ no loss observed").strong()
+            } else {
+                RichText::new("⚠ loss observed")
+                    .color(LOSS_WARN_COLOR)
+                    .strong()
+            });
+        });
+        ui.weak(
+            "Derived from the 16-bit XCP-on-Ethernet CTR of every received frame, plus per-DAQ-list              cycle completeness. Incomplete cycles are discarded, never recorded.",
+        );
+        ui.separator();
+
+        let link = &controller.link_stats;
+        egui::Grid::new("xcp_link_integrity_grid")
+            .num_columns(2)
+            .spacing([18.0, 4.0])
+            .show(ui, |ui| {
+                ui.label("Frames received:");
+                ui.monospace(format!("{}", link.frames_received));
+                ui.end_row();
+
+                ui.label("CTR gaps / frames lost:");
+                ui.horizontal(|ui| {
+                    loss_cell(ui, link.gaps_detected);
+                    ui.weak("/");
+                    loss_cell(ui, link.frames_lost_estimate);
+                });
+                ui.end_row();
+
+                ui.label("Reordered / duplicated:");
+                ui.horizontal(|ui| {
+                    loss_cell(ui, link.reordered);
+                    ui.weak("/");
+                    loss_cell(ui, link.duplicated);
+                });
+                ui.end_row();
+
+                ui.label("DAQ queue overflow drops:");
+                loss_cell(ui, link.channel_overflow_drops);
+                ui.end_row();
+
+                ui.label("Unplanned DTOs:");
+                loss_cell(ui, link.unplanned_dto);
+                ui.end_row();
+            });
+
+        if !controller.recent_cycle_discards.is_empty() {
+            ui.separator();
+            ui.label(
+                RichText::new(format!(
+                    "Recent discarded cycles ({})",
+                    controller.recent_cycle_discards.len()
+                ))
+                .strong(),
+            );
+            egui::ScrollArea::vertical()
+                .id_salt("xcp_recent_discards")
+                .max_height(110.0)
+                .show(ui, |ui| {
+                    for (host_s, discard) in controller.recent_cycle_discards.iter().rev() {
+                        ui.monospace(format!(
+                            "{:.3}  event 0x{:04X}  DAQ {}  — {}",
+                            host_s,
+                            discard.event_channel_id,
+                            discard.daq_list_num,
+                            discard.reason.label()
+                        ));
+                    }
+                });
+        }
+    });
 }
