@@ -10,7 +10,12 @@
     "default_log_folder": "./logfile",
     "default_file_prefix": "Measurement",
     "max_logfile_size_mb": 500,
-    "prefer_target_utc_clock": true
+    "prefer_target_utc_clock": true,
+    "record_video_mp4": true,
+    "video_fps": 10,
+    "video_encoder": "libx264",
+    "video_width": 1280,
+    "video_height": 720
   },
   "calibration": {
     "watch_list": [],
@@ -20,5 +25,17 @@
   "ui": {
     "dark_mode": true,
     "enable_mock_server": false
+  },
+  "visualization": {
+    "ego": {
+      "length_m": 4.85,
+      "width_m": 1.90,
+      "rear_axle_to_center_m": 1.425,
+      "show_ego": true,
+      "iso8855_axes": true
+    },
+    "xy_layers": [],
+    "time_plot_signals": [],
+    "time_plot_window_s": 20.0
   }
 }

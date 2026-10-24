@@ -8,5 +8,6 @@ pub mod calibration;
 pub mod config_store;
 pub mod mock_server;
 pub mod recording;
+pub mod replay;
 pub mod ui;
 pub mod xcp;

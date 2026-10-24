@@ -76,7 +76,7 @@ impl RecordingFileNamer {
         &self.folder
     }
 
-    /// Returns the filename (without directory) for a specific 1-based `part_number`.
+    /// Returns the `.sdf` filename (without directory) for a specific 1-based `part_number`.
     pub fn filename_for_part(&self, part_number: u32) -> String {
         format!(
             "{}_{}_PART{:03}.sdf",
@@ -86,12 +86,28 @@ impl RecordingFileNamer {
         )
     }
 
-    /// Returns the full [`PathBuf`] for the current split part.
+    /// Returns the `.mp4` filename (without directory) for a specific 1-based `part_number`.
+    pub fn mp4_filename_for_part(&self, part_number: u32) -> String {
+        format!(
+            "{}_{}_PART{:03}.mp4",
+            self.prefix,
+            self.start_utc_human,
+            part_number.max(1)
+        )
+    }
+
+    /// Returns the full [`PathBuf`] for the current `.sdf` split part.
     pub fn current_file_path(&self) -> PathBuf {
         self.folder.join(self.filename_for_part(self.current_part))
     }
 
-    /// Advances to the next part number (`PART001` -> `PART002`) and returns the new file path.
+    /// Returns the full [`PathBuf`] for the current `.mp4` split part.
+    pub fn current_mp4_file_path(&self) -> PathBuf {
+        self.folder
+            .join(self.mp4_filename_for_part(self.current_part))
+    }
+
+    /// Advances to the next part number (`PART001` -> `PART002`) and returns the new `.sdf` file path.
     pub fn advance_part(&mut self) -> PathBuf {
         self.current_part = self.current_part.saturating_add(1);
         self.current_file_path()

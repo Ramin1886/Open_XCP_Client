@@ -1,8 +1,9 @@
 // SPDX-License-Identifier: GPL-2.0-only
 //! Dedicated Settings Menu modal (`⚙ Settings`) allowing configuration of
 //! Target Connection (IP, Port, UDP/TCP, local A2L fallback, Mock server),
-//! Recording & Logfile Split Size (default 500 MB), and Calibration options,
-//! persisted in `./config/settings.json`.
+//! Recording & Logfile/Video Split Size (default 500 MB), 2D Video Recording options,
+//! Ego Vehicle dimensions (`length_m`, `width_m`, `rear_axle_to_center_m`),
+//! and Calibration options, persisted in `./config/settings.json`.
 
 use crate::app_state::AppController;
 use crate::config_store::{AppSettings, TransportProtocol};
@@ -18,9 +19,11 @@ pub fn render_settings_menu(ctx: &Context, controller: &mut AppController) {
     egui::Window::new("⚙ Settings")
         .open(&mut open)
         .resizable(true)
-        .default_width(480.0)
+        .default_width(520.0)
         .show(ctx, |ui| {
-            render_settings_contents(ui, controller);
+            egui::ScrollArea::vertical().show(ui, |ui| {
+                render_settings_contents(ui, controller);
+            });
         });
     controller.settings_menu_open = open;
 }
@@ -81,12 +84,12 @@ pub fn render_settings_contents(ui: &mut Ui, controller: &mut AppController) {
         });
 
     ui.separator();
-    ui.heading(RichText::new("Recording & Logfile Splitting").strong());
+    ui.heading(RichText::new("Recording & Synchronized Size Splitting (.sdf + .mp4)").strong());
     egui::Grid::new("settings_rec_grid")
         .num_columns(2)
         .spacing([16.0, 8.0])
         .show(ui, |ui| {
-            ui.label("Logfile Split Size (MB):");
+            ui.label("Logfile / Video Split Size (MB):");
             ui.horizontal(|ui| {
                 ui.add(
                     egui::DragValue::new(&mut controller.settings.recording.max_logfile_size_mb)
@@ -111,7 +114,91 @@ pub fn render_settings_contents(ui: &mut Ui, controller: &mut AppController) {
                 "Prefer target DAQ clock correlated to UTC",
             );
             ui.end_row();
+
+            ui.label("Record 2D Plot Video (.mp4):");
+            ui.checkbox(
+                &mut controller.settings.recording.record_video_mp4,
+                "Record H.264 .mp4 video alongside .sdf logfile",
+            );
+            ui.end_row();
+
+            ui.label("Video Frame Rate (FPS):");
+            ui.add(
+                egui::DragValue::new(&mut controller.settings.recording.video_fps)
+                    .range(1..=30)
+                    .suffix(" FPS"),
+            );
+            ui.end_row();
+
+            ui.label("Video H.264 Encoder:");
+            ui.horizontal_wrapped(|ui| {
+                for enc in ["libx264", "h264_nvenc", "h264_qsv", "h264_amf", "native"] {
+                    ui.selectable_value(
+                        &mut controller.settings.recording.video_encoder,
+                        enc.to_string(),
+                        enc,
+                    );
+                }
+            });
+            ui.end_row();
         });
+
+    ui.separator();
+    ui.heading(RichText::new("Ego Vehicle Geometry & 2D Coordinate System").strong());
+    egui::Grid::new("settings_ego_grid")
+        .num_columns(2)
+        .spacing([16.0, 8.0])
+        .show(ui, |ui| {
+            ui.label("Show Ego Vehicle:");
+            ui.checkbox(
+                &mut controller.settings.visualization.ego.show_ego,
+                "Render Ego footprint & rear-axle origin at (0, 0)",
+            );
+            ui.end_row();
+
+            ui.label("Coordinate Convention:");
+            ui.checkbox(
+                &mut controller.settings.visualization.ego.iso8855_axes,
+                "ISO 8855 Vehicle Axes (+X Forward/Up, +Y Left)",
+            );
+            ui.end_row();
+
+            ui.label("Ego Length (m):");
+            ui.add(
+                egui::DragValue::new(&mut controller.settings.visualization.ego.length_m)
+                    .range(0.5..=30.0)
+                    .speed(0.05)
+                    .suffix(" m"),
+            );
+            ui.end_row();
+
+            ui.label("Ego Width (m):");
+            ui.add(
+                egui::DragValue::new(&mut controller.settings.visualization.ego.width_m)
+                    .range(0.5..=10.0)
+                    .speed(0.05)
+                    .suffix(" m"),
+            );
+            ui.end_row();
+
+            ui.label("Rear-Axle to Center (m):");
+            ui.add(
+                egui::DragValue::new(
+                    &mut controller.settings.visualization.ego.rear_axle_to_center_m,
+                )
+                .range(-15.0..=15.0)
+                .speed(0.05)
+                .suffix(" m"),
+            );
+            ui.end_row();
+        });
+    let ego = &controller.settings.visualization.ego;
+    ui.weak(format!(
+        "Footprint wrt Rear Axle (0,0): Front = {:+.2} m | Rear = {:+.2} m | Half-Width = ±{:.2} m",
+        ego.front_extent_m(),
+        ego.rear_extent_m(),
+        ego.half_width_m()
+    ));
 
     ui.separator();
     ui.heading(RichText::new("Calibration & Interface").strong());

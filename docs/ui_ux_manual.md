@@ -1,57 +1,65 @@
-# UI / UX Operator Manual
+# UI / UX Operator Manual (5 Tabs, 2D Plot & Replay)
 
 [← Back to Documentation Index](./index.md)
 
 ## Interface Layout
 
-**Open_XCP_Client** provides a clean, distraction-free engineering layout composed of:
-1. **Top Navigation Bar** ([`src/ui/top_bar.rs`](../src/ui/top_bar.rs))
-2. **Settings Menu Modal (`⚙ Settings`)** ([`src/ui/settings_menu.rs`](../src/ui/settings_menu.rs))
-3. **Logging Tab (`● Logging`)** ([`src/ui/logging_tab.rs`](../src/ui/logging_tab.rs))
-4. **Calibration Tab (`◈ Calibration`)** ([`src/ui/calibration_tab.rs`](../src/ui/calibration_tab.rs))
-5. **Bottom Status Bar** ([`src/ui/mod.rs`](../src/ui/mod.rs))
+**Open_XCP_Client** provides a clean, responsive 5-tab engineering workspace composed of:
+1. **Top Navigation & Mode Bar** ([`src/ui/top_bar.rs`](../src/ui/top_bar.rs)):
+   - **`🟢 Live` / `🎞 Replay`** mode switch
+   - **5-Tab Switcher**: **`📐 2D Live Plot`** (`Ctrl+1`), **`🔢 Numerical`** (`Ctrl+2`), **`📈 Time Plot`** (`Ctrl+3`), **`🎛 Calibration`** (`Ctrl+4`), and **`📡 XCP Info`** (`Ctrl+5`)
+   - **Context Bar**: Live Recording Bar (Folder, Prefix, MP4 toggle, FPS, `⏺ Start / ⏹ Stop Recording`) in `Live` mode, or `.sdf` Replay Transport Bar (`.sdf` loader, `▶ Play / ⏸ Pause`, `■ Stop`, Speed `0.25×..10× / max`, continuous Time Slider) in `Replay` mode
+   - **`⚙ Settings` Button** ([`src/ui/settings_menu.rs`](../src/ui/settings_menu.rs))
+2. **Tab 1 — `📐 2D Live Plot`** ([`src/ui/plane_plot_tab.rs`](../src/ui/plane_plot_tab.rs))
+3. **Tab 2 — `🔢 Numerical`** ([`src/ui/numerical_tab.rs`](../src/ui/numerical_tab.rs))
+4. **Tab 3 — `📈 Time Plot`** ([`src/ui/time_plot_tab.rs`](../src/ui/time_plot_tab.rs))
+5. **Tab 4 — `🎛 Calibration`** ([`src/ui/calibration_tab.rs`](../src/ui/calibration_tab.rs))
+6. **Tab 5 — `📡 XCP Info`** ([`src/ui/xcp_info_tab.rs`](../src/ui/xcp_info_tab.rs))
 
 ---
 
-## 1. Top Navigation Bar & `⚙ Settings` Menu
+## 1. Operating the `2D Live Plot` Tab (`Ctrl+1`)
 
-- **Tab Switcher**: Toggle between **`● Logging`** and **`◈ Calibration`** at any time — switching tabs never interrupts active recording or network communication.
-- **Connection Control**: Displays the target IP, Port, Transport (`UDP`/`TCP`), and loaded A2L summary (`[Meas | Events | Cal]`), alongside the **`Connect` / `Disconnect`** button.
-- **`⚙ Settings` Button** (Top-Right): Opens the **Settings Menu modal** where you can configure and save to `./config/settings.json`:
-  - **Target IP Address & Port** (default `127.0.0.1:5555`)
-  - **Transport Protocol** (`UDP` or `TCP`)
-  - **Connect Timeout (ms)** (default `2000 ms`)
-  - **Local A2L Fallback Path** (optional local `.a2l` file if target upload is disabled)
-  - **Built-in Mock XCPlite Server** (check this option to spawn an in-process simulated QNX ADAS target on Connect)
-  - **Logfile Split Size (MB)** (default **`500 MB`**)
-  - **Default Log Folder** (`./logfile`) and **Default Logfile Prefix** (`Measurement`)
-  - **Target UTC Clock Preference**, **Readback Verification**, **Active Calibration Page**, and **Dark Mode**.
-
----
-
-## 2. Operating the Logging Tab
-
-1. Verify or edit the **Storage Folder** input field (default `./logfile`).
-2. Verify or edit the **Logfile Name Prefix** input field (default `Measurement`). A live preview shows the exact filename pattern:
-   `./logfile/Measurement_YYYY-MM-DD_HH-MM-SSZ_PART001.sdf`
-3. Click **`⏺ Start Recording`**:
-   - The button turns red (`⏹ Stop Recording`).
-   - All A2L measurements are subscribed to DAQ lists at their native `EVENT` refresh rates.
-   - The progress bar tracks the current `.sdf` file size against the configured **Split Limit** (default `500 MB`) and automatically increments `PART001` $\rightarrow$ `PART002` when full.
-4. Browse the **Recorded Measurement Variables & Hierarchy** tree to inspect nested C/C++ structures, event rates, units, and live decoded values.
-5. Click **`⏹ Stop Recording`** to stop DAQ acquisition and flush the active `.sdf` part to disk.
+- **Coordinate Convention**: Defaults to **ISO 8855 vehicle body coordinates** (`+x` forward/up, `+y` left, origin `(0, 0)` at the rear-axle center). Toggle **ISO 8855 (+X Up, +Y Left)** in the left sidebar or in `⚙ Settings` to switch between ISO 8855 and standard Cartesian (`+x` right, `+y` up) axes.
+- **Interactive Navigation**:
+  - **Mouse Wheel**: Zoom in/out anchored at the cursor position (`1..500 px/m`) with a zoom-adaptive `1-2-5` metric grid (`0.1 m`..`50 m`).
+  - **Left-Drag**: Pan the 2D ground plane.
+  - **Double-Click** (or **`↺ Reset View`**): Reset the viewport to the default origin view.
+- **Configurable Ego Vehicle Footprint**:
+  - In **`⚙ Settings`**, configure **Ego Length (m)** (default `4.85`), **Ego Width (m)** (default `1.90`), and **Rear-Axle to Center (m)** (default `1.425`).
+- **Pairing `(X, Y)` Signals (Scalar, Vector, Broadcast & Polygons)**:
+  - Use the **Filter A2L Signals** box in the left sidebar to search all measurements.
+  - Click **`Set X`** and **`Set Y`** next to any measurement (or type the signal names directly), choose a **Style** (`Points / Scatter`, `Connected Line`, `History Trail`, or `4-Corner Polygon (P0..P3)`), pick a color, and click **`➕ Add (X, Y) Layer to 2D Plot`**.
+  - Works seamlessly whether `X` and `Y` are both scalars, both 1D/N-D arrays (`MATRIX_DIM`), or one scalar and one vector (automatic broadcast), with optional **Valid Count** truncation.
 
 ---
 
-## 3. Operating the Calibration Tab
+## 2. Operating the `Numerical` Tab (`Ctrl+2`)
 
-1. In the left pane (**1. Find Calibration Variable**), type a substring in the **Search** box to locate any A2L `CHARACTERISTIC`.
-2. Click **`+ Add`** to place the parameter into the right pane (**2. Active Calibration Content**).
-3. Inspect the **Current** value read from the target.
-4. Type a new value in the **New Value** input field (or choose an enum state from the combo box) and press **`Enter`**.
-5. Confirm that the status badge transitions to **`✓ Synced`** (or displays an inline validation message if the entered value violates the parameter's data type or `[LowerLimit, UpperLimit]`).
+- Displays all measurements organized by their C/C++ structure hierarchy.
+- Type in **🔍 Filter** to narrow down signals or structure groups immediately.
+- Use **`➕ Expand All`** / **`➖ Collapse All`** to expand or collapse all nested structure groups.
+- Shows each signal's physical value (or verbal `COMPU_VTAB` enum string / array summary), unit, raw value, and XCP event rate, with a **1.0-second visual highlight** whenever a signal's value changes.
 
 ---
 
-## Next Steps
-- [CI/CD Pipelines, Release Packaging & >=95% Test Coverage →](./ci_cd_and_packaging.md)
+## 3. Operating the `Time Plot` Tab (`Ctrl+3`)
+
+- In the left panel, filter and check up to 12 signals (`☑`) to plot in the 2-column strip-chart grid.
+- Select a time window preset (**`10 s`**, **`20 s`**, **`60 s`**, **`120 s`**) or hover any chart and scroll the mouse wheel to zoom the time window (`1..120 s`) anchored at the newest sample on the right edge.
+- Double-click any chart to reset the time window to `20 s`, or click **`❄ Freeze`** to pause trace updates for inspection.
+
+---
+
+## 4. Operating the `Calibration` Tab (`Ctrl+4`) & `XCP Info` Tab (`Ctrl+5`)
+
+- **Calibration Tab (`Ctrl+4`)**: Search A2L `CHARACTERISTIC` parameters on the left, click **`+ Add`**, edit the value in the **New Value** field, and press **`Enter`** to validate and transmit to target memory concurrently during live streaming or recording.
+- **XCP Info Tab (`Ctrl+5`)**: Inspect target connection metadata, A2L summary, active/finalized `.sdf` and `.mp4` part files, and the live per-`EVENT` DAQ telemetry table (A2L Cycle `ms`, Measured Mean/Max Cycle `ms`, Sample Count, Latest UTC Timestamp, Age `ms`).
+
+---
+
+## 5. Multi-Part `.sdf` Replay (`🎞 Replay` Mode)
+
+1. Click **`🎞 Replay`** in the top bar.
+2. Enter a path to a single `.sdf` file, multiple comma-separated `.sdf` files, or a directory containing `PART001.sdf`, `PART002.sdf`, ..., and click **`📂 Load .sdf`**.
+3. Use **`▶ Play` / `⏸ Pause`**, **`■ Stop`**, the **Speed** selector (`0.25×`..`10×`, `max`), and the **continuous Time Slider** to scrub across the entire recording while inspecting any of the 5 tabs.

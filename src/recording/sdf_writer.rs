@@ -246,6 +246,15 @@ impl SdfSessionRecorder {
         Ok(rotated_file)
     }
 
+    /// Forces an immediate rotation to `PART{N+1}.sdf` (for example, when the companion `.mp4`
+    /// video file reaches the configured split size limit first), returning the completed `.sdf` path.
+    pub fn force_rotate_part(&mut self) -> Result<PathBuf, SdfError> {
+        let written_path = self.flush_current_part()?;
+        self.namer.advance_part();
+        self.splitter.reset_for_new_part();
+        Ok(written_path)
+    }
+
     /// Finalizes the recording session, flushing the active `.sdf` part to disk and returning
     /// the list of all `.sdf` part files generated during the session.
     pub fn finish(&mut self) -> Result<Vec<PathBuf>, SdfError> {

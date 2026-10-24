@@ -3,7 +3,7 @@
 [![CI & Coverage](https://github.com/Ramin1886/Open_XCP_Client/actions/workflows/ci.yml/badge.svg)](https://github.com/Ramin1886/Open_XCP_Client/actions/workflows/ci.yml)
 [![Build & Release Binaries](https://github.com/Ramin1886/Open_XCP_Client/actions/workflows/release.yml/badge.svg)](https://github.com/Ramin1886/Open_XCP_Client/actions/workflows/release.yml)
 
-**Open_XCP_Client** is a lightweight, self-contained **XCP on Ethernet (`UDP`/`TCP`) measurement recorder and live calibration client** engineered in Rust (`egui`/`eframe` + `tokio`).
+**Open_XCP_Client** is a lightweight, self-contained **XCP on Ethernet (`UDP`/`TCP`) measurement recorder, real-time 2D/time-series visualizer, `.sdf` replay analyzer, and live calibration client** engineered in Rust (`egui`/`eframe` + `tokio`).
 
 It is purpose-built for embedded ADAS and automotive software integrating **Vector `xcplite` 2.2.2** on POSIX/QNX targets (such as Qualcomm SoC platforms running QNX 7.1), where the ASAM MCD-2 MC (`A2L`) description file is generated dynamically during target initialization and uploaded over the network.
 
@@ -16,7 +16,7 @@ It is purpose-built for embedded ADAS and automotive software integrating **Vect
 - [Getting Started](#getting-started)
 - [Operator Workflow](#operator-workflow)
 - [Configuration Reference (`settings.json`)](#configuration-reference-settingsjson)
-- [SDF File Layout & Naming Specification](#sdf-file-layout--naming-specification)
+- [SDF & MP4 File Naming Specification](#sdf--mp4-file-naming-specification)
 - [Codebase Architecture](#codebase-architecture)
 - [Documentation Suite](#documentation-suite)
 - [Verification & Quality Assurance](#verification--quality-assurance)
@@ -39,15 +39,18 @@ flowchart LR
         Trans["Async XCP Transport\n(CTO Lockstep + DAQ Stream)"]
         Parser["A2L Parser & C/C++ Struct Resolver"]
         Planner["Event-Rate DAQ Planner &\nUTC Clock Correlator"]
-        SDF["Hierarchical .sdf Writer &\nSize Splitter (500 MB default)"]
+        SDF["Synchronized .sdf + .mp4 Recorder\n& Size Splitter (500 MB default)"]
+        Replay["Multi-Part .sdf Replay Engine"]
         Cal["Type-Safe Live Calibration Engine"]
-        UI["Immediate-Mode Desktop UI\n(Settings | Logging | Calibration)"]
+        UI["5-Tab Desktop UI\n(2D Plot | Numerical | Time Plot | Calibration | XCP Info)"]
 
         Trans --> Parser
         Parser --> Planner
         Parser --> Cal
         Trans --> Planner
         Planner --> SDF
+        Planner --> UI
+        Replay --> UI
         UI <--> Cal
         UI <--> SDF
         Cal --> Trans
@@ -57,34 +60,41 @@ flowchart LR
 ```
 
 `Open_XCP_Client` decouples network acquisition and disk I/O from the user interface thread:
-1. **UI Thread (`eframe`/`egui`)**: Renders the top navigation bar, the **`⚙ Settings`** modal, the **Logging Tab**, and the **Calibration Tab** with minimal CPU and memory overhead.
-2. **Async XCP & Recording Worker (`tokio`)**: Manages socket communication, dynamic A2L upload, multi-rate DAQ DTO packet demultiplexing, UTC timestamp correlation, and concurrent calibration `SHORT_DOWNLOAD` / `DOWNLOAD` requests without interrupting active recording.
+1. **UI Thread (`eframe`/`egui`)**: Renders the top navigation bar (`Live` / `Replay` switcher, recording/replay controls, **`⚙ Settings`** button) and the 5 interactive tabs (**2D Live Plot**, **Numerical**, **Time Plot**, **Calibration**, **XCP Info**) with minimal CPU and memory overhead.
+2. **Async XCP & Recording Worker (`tokio`)**: Manages socket communication, dynamic A2L upload, immediate live DAQ DTO packet demultiplexing, UTC timestamp correlation, synchronized `.sdf` + `.mp4` (H.264) recording with lockstep file-size splitting, and concurrent calibration `SHORT_DOWNLOAD` / `DOWNLOAD` requests.
 
 ---
 
 ## Core Capabilities
 
-### 1. Dynamic Target A2L Upload & Structure Reconstruction
+### 1. Dynamic Target A2L Upload & Immediate Live DAQ Streaming
 - Automatically queries the running `xcplite` 2.2.2 server using `GET_ID (IDT_ASAM_UPLOAD = 4)` followed by chunked `UPLOAD` transfers to retrieve the target's A2L specification directly over Ethernet (with an optional local `.a2l` file fallback).
 - Reconstructs complex C/C++ data structures from both ASAM MCD-2 MC v1.7 `TYPEDEF_STRUCTURE` / `STRUCTURE_COMPONENT` / `INSTANCE` declarations and hierarchical symbol paths (e.g., `Perception.RadarFront.targets[0].distance_m`), preserving all nested attributes and multidimensional (`MATRIX_DIM`) arrays.
+- Starts live DAQ streaming immediately on connect so all visualization and numerical tabs update in real time before recording to disk.
 
-### 2. Native Refresh-Rate `.sdf` Recording & UTC Time-Series
-- Groups all `MEASUREMENT` variables by their native XCP `EVENT` channel (`1 ms`, `10 ms`, `100 ms`, etc.) and configures dedicated DAQ lists on the target so every signal is recorded at its true refresh rate.
-- Correlates target `GET_DAQ_CLOCK` (`0xDC`) and 32-bit DTO packet timestamps into UTC time-series datasets (`time_utc_s` in `float64` seconds and `time_utc_ns` in `int64` nanoseconds), preferring the target's synchronized real-time clock when available.
-- Writes self-contained, hierarchical HDF5 v2 `.sdf` files preserving the full nested structure hierarchy under `/Measurements/...` and `/Events/...`.
+### 2. Interactive 2D Live Plot, `(X, Y)` Signal Pairing & Ego Vehicle Configuration
+- Renders a zoomable, pannable 2D ground plane in **ISO 8855 vehicle body coordinates** (`+x` forward/up, `+y` left, origin `(0, 0)` at the rear-axle center) or standard Cartesian coordinates (`+x` right, `+y` up) with a zoom-adaptive `1-2-5` metric grid (`0.1 m`..`50 m`).
+- Configurable **Ego Vehicle Footprint** in **`⚙ Settings`**: parameterized by **Ego Length (`m`)** (default `4.85 m`), **Ego Width (`m`)** (default `1.90 m`), and **Rear-Axle to Center (`m`)** (default `1.425 m`).
+- Interactive **`(X, Y)` Signal Pair Builder** with instant search filtering: pair any `X` and `Y` A2L signals regardless of whether `X` and `Y` are scalars or vectors (`MATRIX_DIM`) — supporting scalar-scalar, vector-vector, scalar-vector broadcast, optional valid-count truncation, and 4-corner polygon sets (`P0..P3`) across `Scatter`, `Connected Line`, `History Trail`, and `4-Corner Polygon` styles.
 
-### 3. Configurable Automatic File Splitting
-- Stores recordings by default in `./logfile/` using the naming convention:
+### 3. Synchronized `.sdf` + `.mp4` (H.264) Recording & Lockstep Size Splitting
+- Stores recordings by default in `./logfile/` using matched part filenames:
   ```text
   <Prefix>_<YYYY-MM-DD_HH-MM-SSZ>_PART001.sdf
+  <Prefix>_<YYYY-MM-DD_HH-MM-SSZ>_PART001.mp4
   ```
-- Continuously tracks output file size and automatically splits recordings into sequential part files (`PART001.sdf`, `PART002.sdf`, `PART003.sdf`, ...) before exceeding the configured size threshold (**default `500 MB`**, configurable in the `⚙ Settings` menu and persisted in `./config/settings.json`).
-- All parts belonging to the same recording session retain the exact UTC timestamp from the moment **Start Recording** was pressed.
+- Records 100% of incoming DAQ event samples at their native event rates into hierarchical HDF5 v2 `.sdf` files while simultaneously recording the 2D XY Plot offscreen as an H.264 `.mp4` video at a configurable frame rate (`1..30 FPS`, default `10 FPS`).
+- Whenever either the `.sdf` logfile or the `.mp4` video reaches the configured split threshold (**default `500 MB`** in `⚙ Settings`), both rotate in lockstep to `PART002.sdf` and `PART002.mp4` while preserving the original recording-start UTC timestamp.
 
-### 4. Concurrent Type-Safe Live Calibration
-- Dedicated **Calibration Tab** to search available A2L `CHARACTERISTIC` parameters and add them to an active Calibration Content watch-list.
-- Displays live physical values converted via A2L `COMPU_METHOD` (`IDENTICAL`, `LINEAR`, `RAT_FUNC`, `TAB_VERB`) alongside type-aware input fields (`UBYTE`, `SBYTE`, `UWORD`, `SWORD`, `ULONG`, `SLONG`, `A_UINT64`, `A_INT64`, `FLOAT32_IEEE`, `FLOAT64_IEEE`, booleans, enums, and arrays).
-- Validates user edits against both the underlying data type and A2L `[LowerLimit, UpperLimit]` bounds; pressing **`Enter`** immediately transmits the updated value to the target (`SHORT_DOWNLOAD` / `DOWNLOAD` with optional `SHORT_UPLOAD` readback verification) **concurrently while DAQ recording is active**.
+### 4. Multi-Part `.sdf` Replay Mode
+- Switch the top bar from **`🟢 Live`** to **`🎞 Replay`** to load a single `.sdf` file or an entire multi-part recording (`PART001.sdf`, `PART002.sdf`, ...) in chronological order.
+- Full playback transport bar with **`▶ Play` / `⏸ Pause`**, **`■ Stop`**, **Speed selector** (`0.25×`, `0.5×`, `1×`, `2×`, `5×`, `10×`, `max`), and a **continuous Time Slider** with 5-second pre-roll seeking that drives the **2D Live Plot**, **Numerical**, **Time Plot**, and **XCP Info** tabs identically to a live target.
+
+### 5. Numerical Inspector, Rolling Time Plots, XCP Telemetry & Live Calibration
+- **Numerical Tab (`Ctrl+2`)**: Filterable expandable C/C++ structure tree displaying physical values, `COMPU_VTAB` enum labels, array summaries, units, raw values, and a 1.0-second visual highlight on updated signals.
+- **Time Plot Tab (`Ctrl+3`)**: Filterable signal picker (up to 12 signals) paired with a 2-column strip-chart grid featuring configurable time windows (`10 s`, `20 s`, `60 s`, `120 s`), pointer wheel time-zoom (`1..120 s`), double-click reset, and `Freeze`.
+- **Calibration Tab (`Ctrl+4`)**: Searchable A2L `CHARACTERISTIC` finder and active Calibration Content watch-list table with strict data-type and `[LowerLimit, UpperLimit]` validation, transmitting updates to target memory on **`Enter`** concurrently during DAQ streaming/recording.
+- **XCP Info Tab (`Ctrl+5`)**: Displays XCP connection metadata, A2L summary, and a live per-`EVENT` DAQ cycle-time telemetry table (Configured Cycle `ms`, Measured Mean/Max Cycle `ms`, Sample Count, Latest UTC Timestamp, Age `ms`).
 
 ---
 
@@ -125,27 +135,27 @@ The optimized executable is produced at `target/release/open_xcp_client` (or `ta
 
 ## Operator Workflow
 
-1. **Configure Target & Recording Parameters (`⚙ Settings`)**:
+1. **Configure Target, Ego Vehicle & Recording Parameters (`⚙ Settings`)**:
    - Click **`⚙ Settings`** in the top-right navigation bar.
-   - Set **Target IP Address** (e.g., `192.168.1.50`), **Target XCP Port** (default `5555`), and **Transport Protocol** (`UDP` or `TCP`).
-   - Adjust **Logfile Split Size (MB)** (default `500 MB`), **Default Log Folder** (`./logfile`), and **Default Logfile Prefix** (`Measurement`).
-   - *(Optional)* Enable **Built-in Mock XCPlite Server** to test recording and calibration locally against a simulated QNX ADAS target without physical hardware.
-   - Click **`💾 Save Settings to JSON`** to persist settings to `./config/settings.json`.
-2. **Connect & Load Target A2L**:
-   - Click **`Connect`** in the top bar. The client establishes the XCP session, synchronizes the target clock, uploads and parses the A2L description, and populates both the **Logging** and **Calibration** tabs.
-3. **Record Measurements (`.sdf`)**:
-   - Open the **`● Logging`** tab, verify the output folder and filename prefix, and click **`⏺ Start Recording`**.
-   - Inspect live structure trees, sample counters, and active part size progress. Click **`⏹ Stop Recording`** to finalize the session.
-4. **Calibrate Parameters Concurrently**:
-   - Switch to the **`◈ Calibration`** tab (before or during an active recording).
-   - Search for any `CHARACTERISTIC` in the left finder panel and click **`+ Add`** to place it into the active Calibration Content table.
-   - Edit the value in the input field and press **`Enter`** to validate and write the new value to target memory immediately.
+   - Set **Target IP Address**, **Target XCP Port** (default `5555`), and **Transport Protocol** (`UDP` or `TCP`).
+   - Adjust **Logfile / Video Split Size (MB)** (default `500 MB`), **Video Frame Rate (FPS)** (default `10 FPS`), and **Ego Vehicle Geometry** (`Length`, `Width`, `Rear-Axle to Center`, `ISO 8855 Axes`).
+   - *(Optional)* Enable **Built-in Mock XCPlite Server** to test live streaming, plotting, video recording, and calibration locally without hardware.
+   - Click **`💾 Save Settings to JSON`**.
+2. **Connect & Visualize Live Streams**:
+   - Click **`Connect`** in the top bar. Live DAQ streaming starts immediately across all 5 tabs (`Ctrl+1`..`Ctrl+5`).
+   - In **`📐 2D Live Plot`**, filter A2L signals in the left sidebar, pair any `X` and `Y` scalar or vector signals, choose a draw style (`Scatter`, `Connected Line`, `History Trail`, or `4-Corner Polygon`), and click **`➕ Add (X, Y) Layer to 2D Plot`**.
+3. **Record Synchronized `.sdf` + `.mp4` Files**:
+   - Verify the output **Folder**, **Name Prefix**, and **2D Video (`.mp4`)** FPS in the top bar, then click **`⏺ Start Recording (Ctrl+R)`**.
+   - Click **`⏹ Stop Recording (Ctrl+R)`** when finished.
+4. **Replay `.sdf` Recordings Offline**:
+   - Switch the top bar to **`🎞 Replay`**, enter a path to one or more `.sdf` part files (or a directory containing `.sdf` parts), and click **`📂 Load .sdf`**.
+   - Use **`▶ Play` / `⏸ Pause`**, **Speed** (`0.25×`..`10×`, `max`), and the **Time Slider** to scrub through the recording across all tabs.
 
 ---
 
 ## Configuration Reference (`settings.json`)
 
-Runtime settings are stored in `./config/settings.json` (seeded from [`./config/settings.default.json`](./config/settings.default.json)). Calibration watch-lists and UI settings are never written into `.sdf` logfiles.
+Runtime settings are stored in `./config/settings.json` (seeded from [`./config/settings.default.json`](./config/settings.default.json)).
 
 | JSON Path | Type | Default | Description |
 | :--- | :--- | :--- | :--- |
@@ -154,10 +164,21 @@ Runtime settings are stored in `./config/settings.json` (seeded from [`./config/
 | `connection.transport` | `"Udp"` \| `"Tcp"` | `"Udp"` | XCP-on-Ethernet transport layer protocol |
 | `connection.connect_timeout_ms` | `u64` | `2000` | Command response timeout in milliseconds |
 | `connection.local_a2l_fallback_path` | `string` | `""` | Optional local `.a2l` path if target upload is disabled |
-| `recording.default_log_folder` | `string` | `"./logfile"` | Output directory for recorded `.sdf` files |
-| `recording.default_file_prefix` | `string` | `"Measurement"` | Prefix used for `<Prefix>_<UTC>_PARTxxx.sdf` |
-| `recording.max_logfile_size_mb` | `u64` | `500` | Maximum size per `.sdf` part file in megabytes (`1 MB = 1,000,000 B`) |
+| `recording.default_log_folder` | `string` | `"./logfile"` | Output directory for recorded `.sdf` and `.mp4` files |
+| `recording.default_file_prefix` | `string` | `"Measurement"` | Prefix used for `<Prefix>_<UTC>_PARTxxx.{sdf,mp4}` |
+| `recording.max_logfile_size_mb` | `u64` | `500` | Maximum size per `.sdf` or `.mp4` part file in megabytes |
 | `recording.prefer_target_utc_clock` | `bool` | `true` | Prefer target real-time UTC clock (`GET_DAQ_CLOCK`) over host clock |
+| `recording.record_video_mp4` | `bool` | `true` | Record offscreen 2D XY plot as `.mp4` alongside `.sdf` |
+| `recording.video_fps` | `u32` | `10` | Video frame rate in Hz (`1..=30`) |
+| `recording.video_encoder` | `string` | `"libx264"` | H.264 encoder (`"libx264"`, `"h264_nvenc"`, `"h264_qsv"`, `"h264_amf"`, `"native"`) |
+| `visualization.ego.length_m` | `f64` | `4.85` | Ego vehicle length in meters |
+| `visualization.ego.width_m` | `f64` | `1.90` | Ego vehicle width in meters |
+| `visualization.ego.rear_axle_to_center_m` | `f64` | `1.425` | Longitudinal offset (`+x`) from rear axle `(0, 0)` to vehicle center (`m`) |
+| `visualization.ego.show_ego` | `bool` | `true` | Render ego vehicle outline and rear-axle crosshair |
+| `visualization.ego.iso8855_axes` | `bool` | `true` | Use ISO 8855 axes (`+x` up, `+y` left) |
+| `visualization.xy_layers` | `array` | `[]` | Saved 2D `(X, Y)` signal pair layer configurations |
+| `visualization.time_plot_signals` | `string[]` | `[]` | Selected signals in the Time Plot strip-chart grid |
+| `visualization.time_plot_window_s` | `f64` | `20.0` | Rolling time window (`1..120 s`) for Time Plot strip charts |
 | `calibration.watch_list` | `string[]` | `[]` | Saved list of `CHARACTERISTIC` names in Calibration Content |
 | `calibration.verify_readback` | `bool` | `true` | Verify every calibration write via immediate `SHORT_UPLOAD` readback |
 | `calibration.active_cal_page` | `u8` | `0` | Active ECU/XCP calibration page (`0` = Reference, `1` = Working) |
@@ -166,14 +187,15 @@ Runtime settings are stored in `./config/settings.json` (seeded from [`./config/
 
 ---
 
-## SDF File Layout & Naming Specification
+## SDF & MP4 File Naming Specification
 
-- **Filename Pattern**: `<Prefix>_<YYYY-MM-DD_HH-MM-SSZ>_PART<NNN>.sdf`
-  - Example: `Measurement_2026-10-23_14-30-05Z_PART001.sdf`
-- **Internal HDF5 Hierarchy**:
+- **Filename Patterns**:
+  - `<Prefix>_<YYYY-MM-DD_HH-MM-SSZ>_PART<NNN>.sdf`
+  - `<Prefix>_<YYYY-MM-DD_HH-MM-SSZ>_PART<NNN>.mp4`
+- **Internal HDF5 `.sdf` Hierarchy**:
   - `/Events/<EventName>/time_utc_s` — `float64` UTC epoch timestamp vector in seconds (`[N]`)
   - `/Events/<EventName>/time_utc_ns` — `int64` UTC epoch timestamp vector in nanoseconds (`[N]`)
-  - `/Measurements/<StructGroup>/<SubStruct>/<Field>` — `float64` physical value dataset (`[N]` for scalars, `[N, D...]` for arrays) with attributes `unit`, `a2l_symbol`, `ecu_address`, `raw_data_type`, `event_name`, and `timestamp_path`.
+  - `/Measurements/<StructGroup>/<SubStruct>/<Field>` — `float64` physical value dataset (`[N]` for scalars, `[N, D...]` for arrays).
 
 ---
 
@@ -185,8 +207,8 @@ Each source file in [`./src/`](./src/) is scoped to a single, well-defined respo
 | :--- | :--- |
 | [`src/main.rs`](./src/main.rs) | Native `eframe` application bootstrap and `--self-check` CLI entry point |
 | [`src/lib.rs`](./src/lib.rs) | Library root exporting all core subsystems |
-| [`src/config_store.rs`](./src/config_store.rs) | JSON configuration persistence (`./config/settings.json`) and schema validation |
-| [`src/app_state.rs`](./src/app_state.rs) | Application state controller and non-blocking UI $\leftrightarrow$ Worker channel orchestration |
+| [`src/config_store.rs`](./src/config_store.rs) | JSON configuration persistence (`./config/settings.json`), Ego vehicle geometry, and XY layer schema |
+| [`src/app_state.rs`](./src/app_state.rs) | Application state controller, rolling time-series buffers, and UI $\leftrightarrow$ Worker channel orchestration |
 | [`src/a2l/lexer.rs`](./src/a2l/lexer.rs) | Zero-copy tokenizer for ASAM MCD-2 MC (`A2L`) files |
 | [`src/a2l/parser.rs`](./src/a2l/parser.rs) | Parser for `EVENT`, `MEASUREMENT`, `CHARACTERISTIC`, `RECORD_LAYOUT`, and `TYPEDEF_*` blocks |
 | [`src/a2l/struct_resolver.rs`](./src/a2l/struct_resolver.rs) | Recursive C/C++ structure (`TYPEDEF_STRUCTURE` / `INSTANCE`) and path tree builder |
@@ -196,15 +218,21 @@ Each source file in [`./src/`](./src/) is scoped to a single, well-defined respo
 | [`src/xcp/daq_planner.rs`](./src/xcp/daq_planner.rs) | Per-event DAQ list/ODT packer and incoming DTO sample decoder |
 | [`src/xcp/clock_sync.rs`](./src/xcp/clock_sync.rs) | Target `GET_DAQ_CLOCK` + 32-bit DTO timestamp rollover tracker and UTC correlator |
 | [`src/xcp/client.rs`](./src/xcp/client.rs) | High-level XCP Master client (connect, A2L upload, DAQ control, concurrent calibration) |
-| [`src/recording/file_namer.rs`](./src/recording/file_namer.rs) | UTC timestamp formatter and sequential part filename generator |
+| [`src/recording/file_namer.rs`](./src/recording/file_namer.rs) | UTC timestamp formatter and sequential `.sdf` / `.mp4` part filename generator |
 | [`src/recording/size_splitter.rs`](./src/recording/size_splitter.rs) | Byte-budget tracker enforcing the configurable `max_logfile_size_mb` split threshold |
 | [`src/recording/sdf_writer.rs`](./src/recording/sdf_writer.rs) | Hierarchical HDF5 v2 `.sdf` file writer, Jenkins `lookup3` checksums, and verifier reader |
+| [`src/recording/video_recorder.rs`](./src/recording/video_recorder.rs) | Offscreen 2D XY plot rasterizer, `(X, Y)` signal pairing, and `.mp4` (H.264 / ISO BMFF) recorder |
+| [`src/replay/mod.rs`](./src/replay/mod.rs) | Multi-part `.sdf` recording replay engine with speed scaling and 5-second pre-roll seeking |
 | [`src/calibration/validator.rs`](./src/calibration/validator.rs) | Strict data-type syntax parser, A2L `[LowerLimit, UpperLimit]` checker, and raw byte encoder |
 | [`src/calibration/manager.rs`](./src/calibration/manager.rs) | Calibration Content watch-list state machine and Enter-key submission handler |
-| [`src/ui/top_bar.rs`](./src/ui/top_bar.rs) | Top navigation bar with tab switcher, connection indicator, and `⚙ Settings` button |
-| [`src/ui/settings_menu.rs`](./src/ui/settings_menu.rs) | Modal settings dialog for target endpoint, split size (`MB`), and defaults |
-| [`src/ui/logging_tab.rs`](./src/ui/logging_tab.rs) | Logging tab UI (Start/Stop toggle, folder/prefix inputs, split progress, structure tree) |
+| [`src/ui/axis_ticks.rs`](./src/ui/axis_ticks.rs) | Zoom-adaptive `1-2-5` metric grid step and tick formatter |
+| [`src/ui/top_bar.rs`](./src/ui/top_bar.rs) | Top navigation bar with `Live`/`Replay` switch, 5-tab selector, recording/replay bar, and `⚙ Settings` button |
+| [`src/ui/settings_menu.rs`](./src/ui/settings_menu.rs) | Modal settings dialog for target endpoint, split size (`MB`), video options, and Ego vehicle dimensions |
+| [`src/ui/plane_plot_tab.rs`](./src/ui/plane_plot_tab.rs) | Interactive 2D Live Plot canvas and filterable `(X, Y)` signal pair layer builder |
+| [`src/ui/numerical_tab.rs`](./src/ui/numerical_tab.rs) | Filterable hierarchical numerical signal inspector with 1.0-second change highlighting |
+| [`src/ui/time_plot_tab.rs`](./src/ui/time_plot_tab.rs) | Filterable signal picker and 2-column rolling time-series strip-chart grid |
 | [`src/ui/calibration_tab.rs`](./src/ui/calibration_tab.rs) | Calibration tab UI (parameter finder, active watch-list table, type-aware input fields) |
+| [`src/ui/xcp_info_tab.rs`](./src/ui/xcp_info_tab.rs) | XCP target/A2L metadata and per-event DAQ cycle-time telemetry table |
 | [`src/mock_server/`](./src/mock_server/mod.rs) | Built-in Mock `xcplite` 2.2.2 UDP/TCP server and sample ADAS A2L generator |
 
 ---
@@ -217,9 +245,9 @@ Detailed engineering documentation is located in [`./docs/`](./docs/index.md):
 2. [**System Architecture & Performance Optimization**](./docs/architecture.md)
 3. [**XCP on Ethernet Protocol & Vector `xcplite` 2.2.2 Integration**](./docs/xcp_protocol_and_xcplite.md)
 4. [**A2L Parsing & Complex C/C++ Structure Mapping**](./docs/a2l_structure_mapping.md)
-5. [**HDF5-Based `.sdf` File Format & Configurable Size Splitting**](./docs/sdf_file_format.md)
+5. [**HDF5-Based `.sdf` & `.mp4` Video Recording with Size Splitting**](./docs/sdf_file_format.md)
 6. [**Calibration Guide & Data-Type Validation**](./docs/calibration_guide.md)
-7. [**UI / UX Operator Manual**](./docs/ui_ux_manual.md)
+7. [**UI / UX Operator Manual (5 Tabs, 2D Plot & Replay)**](./docs/ui_ux_manual.md)
 8. [**CI/CD Pipelines, Release Packaging & Test Coverage**](./docs/ci_cd_and_packaging.md)
 
 ---
@@ -235,6 +263,6 @@ cargo fmt --all -- --check
 # Run Clippy linter with warnings denied
 cargo clippy --all-targets -- -D warnings
 
-# Run all unit, headless UI, and end-to-end XCP integration tests
+# Run all unit, headless UI, video recording, replay, and end-to-end XCP integration tests
 cargo test
 ```

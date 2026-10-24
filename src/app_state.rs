@@ -1,28 +1,107 @@
 // SPDX-License-Identifier: GPL-2.0-only
 //! Application controller state, background worker command/event channels,
-//! and coordination between the UI, XCP network engine, and `.sdf` recorder.
+//! and coordination between the 5 UI tabs, XCP network engine, `.sdf` + `.mp4`
+//! synchronized recorder, and `.sdf` replay player.
 
 use crate::a2l::model::{A2lModel, Characteristic};
 use crate::a2l::parser::parse_a2l;
 use crate::calibration::manager::CalibrationManager;
-use crate::config_store::{AppSettings, ConfigStore};
+use crate::config_store::{
+    AppSettings, ConfigStore, EgoVehicleSettings, XyDrawStyle, XyPlotLayerConfig,
+};
 use crate::mock_server::MockXcpServer;
 use crate::recording::file_namer::format_utc_for_filename;
 use crate::recording::sdf_writer::SdfSessionRecorder;
+use crate::recording::video_recorder::{
+    extract_xy_points_for_layer, render_plane_plot_rgb24, Mp4VideoRecorder, PlaneViewport,
+};
+use crate::replay::SdfReplayPlayer;
 use crate::xcp::client::XcpClient;
 use crate::xcp::daq_planner::{DaqEventSample, DaqPlanner, DecodedValue};
 use chrono::Utc;
 use crossbeam_channel::{unbounded, Receiver, Sender};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, VecDeque};
 use std::net::SocketAddr;
 use std::path::PathBuf;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
-/// Active primary tab in the UI.
+/// Rolling time-series history retention window in seconds (`120.0 s`).
+pub const TIME_SERIES_HISTORY_SECONDS: f64 = 120.0;
+
+/// Duration in seconds for which a changed value stays highlighted in the Numerical tab.
+pub const VALUE_CHANGE_HIGHLIGHT_SECONDS: f64 = 1.0;
+
+/// Top-level operating mode of the application (`Live` XCP target vs `.sdf` `Replay`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum AppMode {
+    #[default]
+    Live,
+    Replay,
+}
+
+/// Active primary tab in the UI (`Ctrl+1` through `Ctrl+5`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ActiveTab {
-    Logging,
+    PlanePlot,
+    Numerical,
+    TimePlot,
     Calibration,
+    XcpInfo,
+}
+
+impl ActiveTab {
+    /// Alias for backwards compatibility with v0.1 tests.
+    #[allow(non_upper_case_globals)]
+    pub const Logging: Self = Self::Numerical;
+}
+
+/// Per-event runtime DAQ telemetry displayed in the `XCP Info` tab.
+#[derive(Debug, Clone)]
+pub struct EventRuntimeStats {
+    pub event_channel_id: u16,
+    pub event_name: String,
+    pub configured_cycle_ms: f64,
+    pub received_count: u64,
+    pub last_utc_s: f64,
+    pub last_arrival: Option<Instant>,
+    pub recent_intervals_ms: VecDeque<(Instant, f64)>,
+}
+
+impl EventRuntimeStats {
+    pub fn new(event_channel_id: u16, event_name: String, configured_cycle_ms: f64) -> Self {
+        Self {
+            event_channel_id,
+            event_name,
+            configured_cycle_ms,
+            received_count: 0,
+            last_utc_s: 0.0,
+            last_arrival: None,
+            recent_intervals_ms: VecDeque::new(),
+        }
+    }
+
+    /// Mean measured cycle time (`ms`) over the last 5 seconds.
+    pub fn mean_cycle_ms(&self) -> Option<f64> {
+        if self.recent_intervals_ms.is_empty() {
+            return None;
+        }
+        let sum: f64 = self.recent_intervals_ms.iter().map(|(_, dt)| *dt).sum();
+        Some(sum / (self.recent_intervals_ms.len() as f64))
+    }
+
+    /// Maximum measured cycle time (`ms`) over the last 5 seconds.
+    pub fn max_cycle_ms(&self) -> Option<f64> {
+        self.recent_intervals_ms
+            .iter()
+            .map(|(_, dt)| *dt)
+            .fold(None, |acc, v| Some(acc.map_or(v, |m: f64| m.max(v))))
+    }
+
+    /// Milliseconds elapsed since the last sample arrived.
+    pub fn age_ms(&self) -> Option<f64> {
+        self.last_arrival
+            .map(|t| t.elapsed().as_secs_f64() * 1000.0)
+    }
 }
 
 /// Commands dispatched from the UI thread to the background XCP/Recording worker.
@@ -32,6 +111,16 @@ pub enum WorkerCommand {
         settings: AppSettings,
     },
     Disconnect,
+    ConfigureVideoRecording {
+        record_video_mp4: bool,
+        video_fps: u32,
+        video_encoder: String,
+        video_width: u32,
+        video_height: u32,
+        viewport: PlaneViewport,
+        ego: EgoVehicleSettings,
+        xy_layers: Vec<XyPlotLayerConfig>,
+    },
     StartRecording {
         folder: String,
         prefix: String,
@@ -63,8 +152,10 @@ pub enum WorkerEvent {
     Disconnected {
         reason: String,
     },
+    LiveSample(DaqEventSample),
     RecordingStarted {
         active_file: PathBuf,
+        active_video_file: Option<PathBuf>,
         start_utc_human: String,
     },
     RecordingProgress {
@@ -80,8 +171,14 @@ pub enum WorkerEvent {
         new_active_file: PathBuf,
         new_part_number: u32,
     },
+    VideoPartSplit {
+        completed_video_file: PathBuf,
+        new_active_video_file: PathBuf,
+        new_part_number: u32,
+    },
     RecordingStopped {
         completed_files: Vec<PathBuf>,
+        completed_video_files: Vec<PathBuf>,
     },
     CharacteristicValueRead {
         name: String,
@@ -94,10 +191,113 @@ pub enum WorkerEvent {
     StatusMessage(String),
 }
 
+/// Updates 2D trajectory trail buffers for all enabled `XyDrawStyle::TrajectoryTrail` layers.
+pub fn update_trails_for_layers(
+    xy_layers: &[XyPlotLayerConfig],
+    signals_by_name: &BTreeMap<String, DecodedValue>,
+    trails_by_layer: &mut BTreeMap<String, Vec<(f64, f64)>>,
+) {
+    for layer in xy_layers {
+        if layer.enabled && layer.style == XyDrawStyle::TrajectoryTrail {
+            let pts = extract_xy_points_for_layer(layer, signals_by_name);
+            if !pts.is_empty() {
+                let trail = trails_by_layer.entry(layer.name.clone()).or_default();
+                trail.extend(pts);
+                if trail.len() > 400 {
+                    let excess = trail.len() - 400;
+                    trail.drain(0..excess);
+                }
+            }
+        }
+    }
+}
+
+/// Records a [`DaqEventSample`] into `rec` and optionally emits a synchronized 2D video frame
+/// into `video_recorder_opt`, rotating both `.sdf` and `.mp4` part files in lockstep whenever
+/// either reaches `rec.max_part_bytes()`.
+#[allow(clippy::too_many_arguments)]
+pub fn record_synchronized_daq_and_video_sample(
+    rec: &mut SdfSessionRecorder,
+    video_recorder_opt: &mut Option<Mp4VideoRecorder>,
+    emit_video_frame: bool,
+    viewport: &PlaneViewport,
+    ego: &EgoVehicleSettings,
+    xy_layers: &[XyPlotLayerConfig],
+    signals_by_name: &BTreeMap<String, DecodedValue>,
+    trails_by_layer: &BTreeMap<String, Vec<(f64, f64)>>,
+    sample: DaqEventSample,
+    evt_tx: &Sender<WorkerEvent>,
+) {
+    let max_part_bytes = rec.max_part_bytes();
+    let mut did_split = false;
+
+    if let Ok(Some(completed_part)) = rec.record_event_sample(&sample) {
+        did_split = true;
+        let _ = evt_tx.send(WorkerEvent::RecordingPartSplit {
+            completed_file: completed_part,
+            new_active_file: rec.current_file_path(),
+            new_part_number: rec.current_part(),
+        });
+        if let Some(vid) = video_recorder_opt.as_mut() {
+            if let Ok(completed_vid) = vid.rotate_part() {
+                let _ = evt_tx.send(WorkerEvent::VideoPartSplit {
+                    completed_video_file: completed_vid,
+                    new_active_video_file: vid.current_file_path(),
+                    new_part_number: vid.current_part(),
+                });
+            }
+        }
+    }
+
+    if let Some(vid) = video_recorder_opt.as_mut() {
+        if emit_video_frame {
+            if !did_split && vid.should_split(max_part_bytes) {
+                if let Ok(completed_sdf) = rec.force_rotate_part() {
+                    let _ = evt_tx.send(WorkerEvent::RecordingPartSplit {
+                        completed_file: completed_sdf,
+                        new_active_file: rec.current_file_path(),
+                        new_part_number: rec.current_part(),
+                    });
+                }
+                if let Ok(completed_vid) = vid.rotate_part() {
+                    let _ = evt_tx.send(WorkerEvent::VideoPartSplit {
+                        completed_video_file: completed_vid,
+                        new_active_video_file: vid.current_file_path(),
+                        new_part_number: vid.current_part(),
+                    });
+                }
+            }
+            let rgb = render_plane_plot_rgb24(
+                vid.width(),
+                vid.height(),
+                viewport,
+                ego,
+                xy_layers,
+                signals_by_name,
+                trails_by_layer,
+            );
+            let _ = vid.write_rgb24_frame(&rgb);
+        }
+    }
+
+    let vid_bytes = video_recorder_opt
+        .as_ref()
+        .map(|v| v.current_part_bytes())
+        .unwrap_or(0);
+    let _ = evt_tx.send(WorkerEvent::RecordingProgress {
+        active_file: rec.current_file_path(),
+        part_number: rec.current_part(),
+        current_part_bytes: rec.current_part_bytes().max(vid_bytes),
+        max_part_bytes: rec.max_part_bytes(),
+        total_samples: rec.total_samples_recorded(),
+        latest_sample: sample,
+    });
+}
 /// Shared application controller state manipulated by the UI and tests.
 pub struct AppController {
     pub config_store: ConfigStore,
     pub settings: AppSettings,
+    pub mode: AppMode,
     pub active_tab: ActiveTab,
     pub settings_menu_open: bool,
     pub connected: bool,
@@ -105,22 +305,55 @@ pub struct AppController {
     pub target_native_utc: bool,
     pub a2l_model: Option<A2lModel>,
 
-    // Logging tab fields
+    // Recording & Live bar fields
     pub log_folder_input: String,
     pub log_prefix_input: String,
     pub is_recording: bool,
     pub active_recording_file: Option<PathBuf>,
+    pub active_video_file: Option<PathBuf>,
     pub active_part_number: u32,
     pub current_part_bytes: u64,
     pub max_part_bytes: u64,
     pub total_samples_recorded: u64,
     pub completed_files: Vec<PathBuf>,
+    pub completed_video_files: Vec<PathBuf>,
+
+    // Live / Replay signal state & Numerical tab
     pub latest_measurement_values: BTreeMap<usize, DecodedValue>,
+    pub latest_signals_by_name: BTreeMap<String, DecodedValue>,
+    pub signal_changed_at: BTreeMap<usize, Instant>,
     pub measurement_search_filter: String,
+    pub numerical_expand_all: Option<bool>,
+
+    // 2D Live Plot tab state
+    pub plane_viewport: PlaneViewport,
+    pub layer_signal_search_filter: String,
+    pub new_layer_name: String,
+    pub new_layer_x_signal: String,
+    pub new_layer_y_signal: String,
+    pub new_layer_valid_count_signal: String,
+    pub new_layer_style: XyDrawStyle,
+    pub new_layer_color_rgb: [u8; 3],
+    pub new_layer_corners: [String; 8],
+    pub trails_by_layer: BTreeMap<String, Vec<(f64, f64)>>,
+
+    // Time Plot tab state
+    pub time_plot_search_filter: String,
+    pub time_plot_frozen: bool,
+    pub time_series_history: BTreeMap<String, VecDeque<(f64, f64)>>,
+    pub latest_sample_utc_s: f64,
 
     // Calibration tab fields
     pub calibration_search_filter: String,
     pub calibration_manager: CalibrationManager,
+
+    // XCP Info tab telemetry
+    pub event_telemetry: BTreeMap<u16, EventRuntimeStats>,
+
+    // Replay mode state
+    pub replay_player: Option<SdfReplayPlayer>,
+    pub replay_file_input: String,
+    pub last_replay_tick: Instant,
 
     // Status bar
     pub status_message: String,
@@ -148,7 +381,8 @@ impl AppController {
         Self {
             config_store,
             settings,
-            active_tab: ActiveTab::Logging,
+            mode: AppMode::Live,
+            active_tab: ActiveTab::PlanePlot,
             settings_menu_open: false,
             connected: false,
             target_endpoint: String::new(),
@@ -158,19 +392,294 @@ impl AppController {
             log_prefix_input,
             is_recording: false,
             active_recording_file: None,
+            active_video_file: None,
             active_part_number: 1,
             current_part_bytes: 0,
             max_part_bytes,
             total_samples_recorded: 0,
             completed_files: Vec::new(),
+            completed_video_files: Vec::new(),
             latest_measurement_values: BTreeMap::new(),
+            latest_signals_by_name: BTreeMap::new(),
+            signal_changed_at: BTreeMap::new(),
             measurement_search_filter: String::new(),
+            numerical_expand_all: None,
+            plane_viewport: PlaneViewport::default(),
+            layer_signal_search_filter: String::new(),
+            new_layer_name: "Targets XY".to_string(),
+            new_layer_x_signal: String::new(),
+            new_layer_y_signal: String::new(),
+            new_layer_valid_count_signal: String::new(),
+            new_layer_style: XyDrawStyle::Scatter,
+            new_layer_color_rgb: [56, 189, 248],
+            new_layer_corners: Default::default(),
+            trails_by_layer: BTreeMap::new(),
+            time_plot_search_filter: String::new(),
+            time_plot_frozen: false,
+            time_series_history: BTreeMap::new(),
+            latest_sample_utc_s: 0.0,
             calibration_search_filter: String::new(),
             calibration_manager: CalibrationManager::new(),
+            event_telemetry: BTreeMap::new(),
+            replay_player: None,
+            replay_file_input: String::new(),
+            last_replay_tick: Instant::now(),
             status_message: "Ready — Configure target in Settings or click Connect.".to_string(),
             cmd_tx,
             evt_rx,
         }
+    }
+
+    /// Switches between `AppMode::Live` and `AppMode::Replay`.
+    pub fn set_mode(&mut self, mode: AppMode) {
+        if self.mode == mode {
+            return;
+        }
+        if mode == AppMode::Replay && self.is_recording {
+            let _ = self.cmd_tx.send(WorkerCommand::StopRecording);
+        }
+        self.mode = mode;
+        self.last_replay_tick = Instant::now();
+        self.status_message = match mode {
+            AppMode::Live => "Switched to Live XCP mode.".to_string(),
+            AppMode::Replay => {
+                "Switched to SDF Replay mode — Select one or more .sdf part files.".to_string()
+            }
+        };
+    }
+
+    /// Loads one or more `.sdf` part files into the Replay engine and initializes the timeline.
+    pub fn load_replay_files(&mut self, paths: &[PathBuf]) -> Result<(), String> {
+        let mut player = SdfReplayPlayer::load_files(paths).map_err(|e| e.to_string())?;
+        let model = player.a2l_model().clone();
+        self.a2l_model = Some(model.clone());
+        self.init_default_layers_and_plots_for_model(&model);
+        self.clear_runtime_buffers();
+        let initial_samples = player.seek_to_seconds(0.0);
+        for sample in initial_samples {
+            self.ingest_daq_sample(sample);
+        }
+        let file_count = player.loaded_files().len();
+        let dur = player.duration_s();
+        let total = player.total_samples();
+        self.replay_player = Some(player);
+        self.mode = AppMode::Replay;
+        self.last_replay_tick = Instant::now();
+        self.status_message = format!(
+            "Loaded {} .sdf part file(s) for replay ({:.2} s, {} samples).",
+            file_count, dur, total
+        );
+        Ok(())
+    }
+
+    /// Seeks the active `.sdf` replay session to `target_pos_s` (`0.0..=duration_s`).
+    pub fn replay_seek(&mut self, target_pos_s: f64) {
+        let Some(mut player) = self.replay_player.take() else {
+            return;
+        };
+        self.clear_runtime_buffers();
+        let samples = player.seek_to_seconds(target_pos_s);
+        for s in samples {
+            self.ingest_daq_sample(s);
+        }
+        self.replay_player = Some(player);
+    }
+
+    /// Advances the active `.sdf` replay session by `wall_dt_s` seconds if playing.
+    pub fn tick_replay(&mut self, wall_dt_s: f64) {
+        if self.mode != AppMode::Replay {
+            return;
+        }
+        let Some(mut player) = self.replay_player.take() else {
+            return;
+        };
+        let samples = player.advance_by_wall_dt(wall_dt_s);
+        for s in samples {
+            self.ingest_daq_sample(s);
+        }
+        self.replay_player = Some(player);
+    }
+
+    fn clear_runtime_buffers(&mut self) {
+        self.latest_measurement_values.clear();
+        self.latest_signals_by_name.clear();
+        self.signal_changed_at.clear();
+        self.time_series_history.clear();
+        self.trails_by_layer.clear();
+        self.event_telemetry.clear();
+        if let Some(model) = &self.a2l_model {
+            for (&ev_id, ev) in &model.events {
+                self.event_telemetry.insert(
+                    ev_id,
+                    EventRuntimeStats::new(ev_id, ev.name.clone(), ev.refresh_rate_ms()),
+                );
+            }
+        }
+    }
+
+    /// Populates sensible default 2D XY Plot layers and Time Plot signals when an A2L model
+    /// is loaded for the first time and the user's configuration lists are empty.
+    pub fn init_default_layers_and_plots_for_model(&mut self, model: &A2lModel) {
+        for (&ev_id, ev) in &model.events {
+            self.event_telemetry.entry(ev_id).or_insert_with(|| {
+                EventRuntimeStats::new(ev_id, ev.name.clone(), ev.refresh_rate_ms())
+            });
+        }
+
+        if self.new_layer_x_signal.is_empty() {
+            if let Some(first) = model.measurements.first() {
+                self.new_layer_x_signal = first.name.clone();
+            }
+        }
+        if self.new_layer_y_signal.is_empty() {
+            if let Some(second) = model
+                .measurements
+                .get(1)
+                .or_else(|| model.measurements.first())
+            {
+                self.new_layer_y_signal = second.name.clone();
+            }
+        }
+
+        if self.settings.visualization.xy_layers.is_empty() && model.measurements.len() >= 2 {
+            // Try to pair x/dist with y/lat if present, otherwise pair first two signals
+            let x_cand = model
+                .measurements
+                .iter()
+                .find(|m| {
+                    let lower = m.name.to_ascii_lowercase();
+                    lower.contains("dist") || lower.ends_with(".x") || lower.contains("pos_x")
+                })
+                .unwrap_or(&model.measurements[0]);
+            let y_cand = model
+                .measurements
+                .iter()
+                .find(|m| {
+                    let lower = m.name.to_ascii_lowercase();
+                    lower.contains("lat") || lower.ends_with(".y") || lower.contains("pos_y")
+                })
+                .unwrap_or(&model.measurements[1]);
+
+            self.settings
+                .visualization
+                .xy_layers
+                .push(XyPlotLayerConfig {
+                    name: "Primary XY Pair".to_string(),
+                    enabled: true,
+                    x_signal: x_cand.name.clone(),
+                    y_signal: y_cand.name.clone(),
+                    valid_count_signal: String::new(),
+                    corner_signals: Default::default(),
+                    style: XyDrawStyle::Scatter,
+                    color_rgb: [56, 189, 248],
+                    point_radius: 5.5,
+                });
+        }
+
+        if self.settings.visualization.time_plot_signals.is_empty() {
+            for m in model.measurements.iter().take(4) {
+                self.settings
+                    .visualization
+                    .time_plot_signals
+                    .push(m.name.clone());
+            }
+        }
+    }
+
+    /// Ingests a decoded [`DaqEventSample`] into all live/replay visualization buffers:
+    /// - `latest_measurement_values` & `latest_signals_by_name`
+    /// - `signal_changed_at` (for 1.0 s change highlight in the Numerical tab)
+    /// - `time_series_history` (rolling 120 s window for the Time Plot tab)
+    /// - `trails_by_layer` (for 2D Plot layers with `XyDrawStyle::TrajectoryTrail`)
+    /// - `event_telemetry` (for the XCP Info tab)
+    pub fn ingest_daq_sample(&mut self, sample: DaqEventSample) {
+        let now = Instant::now();
+        self.latest_sample_utc_s = sample.time_utc_s;
+
+        // Update per-event runtime telemetry
+        let configured_ms = self
+            .a2l_model
+            .as_ref()
+            .and_then(|m| m.events.get(&sample.event_channel_id))
+            .map(|e| e.refresh_rate_ms())
+            .unwrap_or(10.0);
+        let ev_stat = self
+            .event_telemetry
+            .entry(sample.event_channel_id)
+            .or_insert_with(|| {
+                EventRuntimeStats::new(
+                    sample.event_channel_id,
+                    sample.event_name.clone(),
+                    configured_ms,
+                )
+            });
+        if ev_stat.last_utc_s > 0.0 && sample.time_utc_s > ev_stat.last_utc_s {
+            let dt_ms = (sample.time_utc_s - ev_stat.last_utc_s) * 1_000.0;
+            ev_stat.recent_intervals_ms.push_back((now, dt_ms));
+            while let Some((ts, _)) = ev_stat.recent_intervals_ms.front() {
+                if now.duration_since(*ts).as_secs_f64() > 5.0 {
+                    ev_stat.recent_intervals_ms.pop_front();
+                } else {
+                    break;
+                }
+            }
+        }
+        ev_stat.received_count = ev_stat.received_count.saturating_add(1);
+        ev_stat.last_utc_s = sample.time_utc_s;
+        ev_stat.last_arrival = Some(now);
+
+        let cutoff_utc = sample.time_utc_s - TIME_SERIES_HISTORY_SECONDS;
+
+        for (m_idx, val) in sample.values {
+            let changed = match self.latest_measurement_values.get(&m_idx) {
+                Some(prev) => prev != &val,
+                None => true,
+            };
+            if changed {
+                self.signal_changed_at.insert(m_idx, now);
+            }
+            if let Some(model) = &self.a2l_model {
+                if let Some(m) = model.measurements.get(m_idx) {
+                    let scalar = val.primary_scalar();
+                    if !self.time_plot_frozen {
+                        let series = self.time_series_history.entry(m.name.clone()).or_default();
+                        series.push_back((sample.time_utc_s, scalar));
+                        while let Some(&(t_front, _)) = series.front() {
+                            if t_front < cutoff_utc {
+                                series.pop_front();
+                            } else {
+                                break;
+                            }
+                        }
+                    }
+                    self.latest_signals_by_name
+                        .insert(m.name.clone(), val.clone());
+                }
+            }
+            self.latest_measurement_values.insert(m_idx, val);
+        }
+
+        // Update 2D history trails for any layer using TrajectoryTrail
+        update_trails_for_layers(
+            &self.settings.visualization.xy_layers,
+            &self.latest_signals_by_name,
+            &mut self.trails_by_layer,
+        );
+    }
+
+    /// Synchronizes the current 2D plot scene configuration to the background worker
+    /// so offscreen `.mp4` recording reflects any layer, ego, or viewport changes.
+    pub fn sync_video_scene_to_worker(&self) {
+        let _ = self.cmd_tx.send(WorkerCommand::ConfigureVideoRecording {
+            record_video_mp4: self.settings.recording.record_video_mp4,
+            video_fps: self.settings.recording.video_fps,
+            video_encoder: self.settings.recording.video_encoder.clone(),
+            video_width: self.settings.recording.video_width,
+            video_height: self.settings.recording.video_height,
+            viewport: self.plane_viewport,
+            ego: self.settings.visualization.ego.clone(),
+            xy_layers: self.settings.visualization.xy_layers.clone(),
+        });
     }
 
     /// Returns a live preview of the next logfile name (`<Prefix>_<UTC>_PART001.sdf`).
@@ -188,6 +697,7 @@ impl AppController {
             .save(&self.settings)
             .map_err(|e| e.to_string())?;
         self.max_part_bytes = self.settings.max_logfile_size_bytes();
+        self.sync_video_scene_to_worker();
         self.status_message = format!(
             "Settings saved to {} (Max Split Size: {} MB)",
             self.config_store.path().display(),
@@ -198,6 +708,7 @@ impl AppController {
 
     /// Requests connection to the configured XCP target (or built-in mock server).
     pub fn request_connect(&mut self) {
+        self.mode = AppMode::Live;
         let _ = self.cmd_tx.send(WorkerCommand::Connect {
             settings: self.settings.clone(),
         });
@@ -214,13 +725,14 @@ impl AppController {
         let _ = self.cmd_tx.send(WorkerCommand::Disconnect);
     }
 
-    /// Toggles Start / Stop Recording.
+    /// Toggles Start / Stop Recording (synchronized `.sdf` + `.mp4`).
     pub fn toggle_recording(&mut self) {
         if self.is_recording {
             let _ = self.cmd_tx.send(WorkerCommand::StopRecording);
         } else {
             let max_bytes = self.settings.max_logfile_size_bytes();
             self.max_part_bytes = max_bytes;
+            self.sync_video_scene_to_worker();
             let _ = self.cmd_tx.send(WorkerCommand::StartRecording {
                 folder: self.log_folder_input.clone(),
                 prefix: self.log_prefix_input.clone(),
@@ -273,7 +785,6 @@ impl AppController {
                         verify_readback: self.settings.calibration.verify_readback,
                     });
                 } else {
-                    // Offline preview update when not connected to target
                     self.calibration_manager
                         .mark_synced_with_raw(name, model, &raw_bytes);
                 }
@@ -315,38 +826,57 @@ impl AppController {
                 let cal_count = a2l_model.characteristics.len();
                 let ev_count = a2l_model.events.len();
 
-                // Restore any saved watch_list items that exist in this A2L
+                self.init_default_layers_and_plots_for_model(&a2l_model);
+
                 let saved_watch = self.settings.calibration.watch_list.clone();
                 self.a2l_model = Some(*a2l_model);
                 for name in saved_watch {
                     self.add_calibration_variable(&name);
                 }
                 self.refresh_all_calibrations();
+                self.sync_video_scene_to_worker();
 
                 self.status_message = format!(
-                    "Connected to {} — Loaded A2L ({} measurements, {} events, {} calibrations)",
+                    "Connected to {} — Live DAQ streaming ({} measurements, {} events, {} calibrations)",
                     target_endpoint, meas_count, ev_count, cal_count
                 );
             }
             WorkerEvent::Disconnected { reason } => {
                 self.connected = false;
                 self.is_recording = false;
+                self.active_video_file = None;
                 self.status_message = format!("Disconnected: {}", reason);
+            }
+            WorkerEvent::LiveSample(sample) => {
+                if self.mode == AppMode::Live {
+                    self.ingest_daq_sample(sample);
+                }
             }
             WorkerEvent::RecordingStarted {
                 active_file,
+                active_video_file,
                 start_utc_human,
             } => {
                 self.is_recording = true;
                 self.active_recording_file = Some(active_file.clone());
+                self.active_video_file = active_video_file.clone();
                 self.active_part_number = 1;
                 self.current_part_bytes = 0;
                 self.total_samples_recorded = 0;
-                self.status_message = format!(
-                    "Recording started at {} -> {}",
-                    start_utc_human,
-                    active_file.display()
-                );
+                if let Some(vid) = active_video_file {
+                    self.status_message = format!(
+                        "Recording started at {} -> {} + {}",
+                        start_utc_human,
+                        active_file.display(),
+                        vid.display()
+                    );
+                } else {
+                    self.status_message = format!(
+                        "Recording started at {} -> {}",
+                        start_utc_human,
+                        active_file.display()
+                    );
+                }
             }
             WorkerEvent::RecordingProgress {
                 active_file,
@@ -361,8 +891,8 @@ impl AppController {
                 self.current_part_bytes = current_part_bytes;
                 self.max_part_bytes = max_part_bytes;
                 self.total_samples_recorded = total_samples;
-                for (m_idx, val) in latest_sample.values {
-                    self.latest_measurement_values.insert(m_idx, val);
+                if self.mode == AppMode::Live {
+                    self.ingest_daq_sample(latest_sample);
                 }
             }
             WorkerEvent::RecordingPartSplit {
@@ -370,7 +900,7 @@ impl AppController {
                 new_active_file,
                 new_part_number,
             } => {
-                self.completed_files.push(completed_file.clone());
+                self.completed_files.push(completed_file);
                 self.active_recording_file = Some(new_active_file.clone());
                 self.active_part_number = new_part_number;
                 self.status_message = format!(
@@ -379,12 +909,27 @@ impl AppController {
                     new_active_file.display()
                 );
             }
-            WorkerEvent::RecordingStopped { completed_files } => {
+            WorkerEvent::VideoPartSplit {
+                completed_video_file,
+                new_active_video_file,
+                new_part_number,
+            } => {
+                self.completed_video_files.push(completed_video_file);
+                self.active_video_file = Some(new_active_video_file);
+                self.active_part_number = new_part_number;
+            }
+            WorkerEvent::RecordingStopped {
+                completed_files,
+                completed_video_files,
+            } => {
                 self.is_recording = false;
+                self.active_video_file = None;
                 self.completed_files = completed_files;
+                self.completed_video_files = completed_video_files;
                 self.status_message = format!(
-                    "Recording stopped — {} .sdf file(s) finalized.",
-                    self.completed_files.len()
+                    "Recording stopped — {} .sdf file(s) and {} .mp4 file(s) finalized.",
+                    self.completed_files.len(),
+                    self.completed_video_files.len()
                 );
             }
             WorkerEvent::CharacteristicValueRead { name, raw_bytes } => {
@@ -410,6 +955,33 @@ impl Drop for AppController {
     }
 }
 
+#[derive(Clone)]
+struct WorkerVideoConfig {
+    record_video_mp4: bool,
+    video_fps: u32,
+    video_encoder: String,
+    video_width: u32,
+    video_height: u32,
+    viewport: PlaneViewport,
+    ego: EgoVehicleSettings,
+    xy_layers: Vec<XyPlotLayerConfig>,
+}
+
+impl Default for WorkerVideoConfig {
+    fn default() -> Self {
+        Self {
+            record_video_mp4: true,
+            video_fps: 10,
+            video_encoder: "libx264".to_string(),
+            video_width: 1280,
+            video_height: 720,
+            viewport: PlaneViewport::default(),
+            ego: EgoVehicleSettings::default(),
+            xy_layers: Vec::new(),
+        }
+    }
+}
+
 fn run_background_worker(cmd_rx: Receiver<WorkerCommand>, evt_tx: Sender<WorkerEvent>) {
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
@@ -426,19 +998,36 @@ fn run_background_worker(cmd_rx: Receiver<WorkerCommand>, evt_tx: Sender<WorkerE
             tokio::sync::mpsc::Receiver<crate::xcp::transport::IncomingDaqDto>,
         > = None;
         let mut recorder_opt: Option<SdfSessionRecorder> = None;
+        let mut video_recorder_opt: Option<Mp4VideoRecorder> = None;
+        let mut video_cfg = WorkerVideoConfig::default();
+        let mut worker_signals_by_name: BTreeMap<String, DecodedValue> = BTreeMap::new();
+        let mut worker_trails_by_layer: BTreeMap<String, Vec<(f64, f64)>> = BTreeMap::new();
+        let mut last_video_frame_instant = Instant::now();
 
         loop {
-            // Process any pending UI commands without blocking DAQ
             while let Ok(cmd) = cmd_rx.try_recv() {
                 match cmd {
                     WorkerCommand::Connect { settings } => {
                         if let Some(mut rec) = recorder_opt.take() {
                             let _ = rec.finish();
                         }
+                        if let Some(mut vid) = video_recorder_opt.take() {
+                            let _ = vid.finish();
+                        }
                         if let Some(client) = active_client.take() {
                             let _ = client.disconnect().await;
                         }
                         mock_server = None;
+                        worker_signals_by_name.clear();
+                        worker_trails_by_layer.clear();
+
+                        video_cfg.record_video_mp4 = settings.recording.record_video_mp4;
+                        video_cfg.video_fps = settings.recording.video_fps.clamp(1, 30);
+                        video_cfg.video_encoder = settings.recording.video_encoder.clone();
+                        video_cfg.video_width = settings.recording.video_width;
+                        video_cfg.video_height = settings.recording.video_height;
+                        video_cfg.ego = settings.visualization.ego.clone();
+                        video_cfg.xy_layers = settings.visualization.xy_layers.clone();
 
                         let target_addr: SocketAddr = if settings.ui.enable_mock_server {
                             match MockXcpServer::start(0).await {
@@ -503,6 +1092,9 @@ fn run_background_worker(cmd_rx: Receiver<WorkerCommand>, evt_tx: Sender<WorkerE
                                                 &model,
                                                 client.max_dto().saturating_sub(6),
                                             );
+                                            // Start live DAQ streaming immediately on connect
+                                            let _ = client.configure_and_start_daq(&planner).await;
+
                                             let native_utc = clock_sync.is_target_native_utc();
                                             active_clock_sync = clock_sync;
                                             active_planner = Some(planner);
@@ -541,14 +1133,24 @@ fn run_background_worker(cmd_rx: Receiver<WorkerCommand>, evt_tx: Sender<WorkerE
                         }
                     }
                     WorkerCommand::Disconnect => {
-                        if let Some(mut rec) = recorder_opt.take() {
-                            if let Ok(files) = rec.finish() {
-                                let _ = evt_tx.send(WorkerEvent::RecordingStopped {
-                                    completed_files: files,
-                                });
-                            }
+                        let completed_sdf = if let Some(mut rec) = recorder_opt.take() {
+                            rec.finish().unwrap_or_default()
+                        } else {
+                            Vec::new()
+                        };
+                        let completed_mp4 = if let Some(mut vid) = video_recorder_opt.take() {
+                            vid.finish().unwrap_or_default()
+                        } else {
+                            Vec::new()
+                        };
+                        if !completed_sdf.is_empty() || !completed_mp4.is_empty() {
+                            let _ = evt_tx.send(WorkerEvent::RecordingStopped {
+                                completed_files: completed_sdf,
+                                completed_video_files: completed_mp4,
+                            });
                         }
                         if let Some(client) = active_client.take() {
+                            let _ = client.stop_daq().await;
                             let _ = client.disconnect().await;
                         }
                         daq_rx_opt = None;
@@ -556,6 +1158,27 @@ fn run_background_worker(cmd_rx: Receiver<WorkerCommand>, evt_tx: Sender<WorkerE
                         let _ = evt_tx.send(WorkerEvent::Disconnected {
                             reason: "User disconnected".to_string(),
                         });
+                    }
+                    WorkerCommand::ConfigureVideoRecording {
+                        record_video_mp4,
+                        video_fps,
+                        video_encoder,
+                        video_width,
+                        video_height,
+                        viewport,
+                        ego,
+                        xy_layers,
+                    } => {
+                        video_cfg = WorkerVideoConfig {
+                            record_video_mp4,
+                            video_fps: video_fps.clamp(1, 30),
+                            video_encoder,
+                            video_width,
+                            video_height,
+                            viewport,
+                            ego,
+                            xy_layers,
+                        };
                     }
                     WorkerCommand::StartRecording {
                         folder,
@@ -581,9 +1204,37 @@ fn run_background_worker(cmd_rx: Receiver<WorkerCommand>, evt_tx: Sender<WorkerE
                                     } else {
                                         let active_file = rec.current_file_path();
                                         let start_utc_human = format_utc_for_filename(start_utc);
+                                        let mut active_video_file = None;
+                                        if video_cfg.record_video_mp4 {
+                                            if let Ok(mut vid) = Mp4VideoRecorder::new(
+                                                &folder,
+                                                &prefix,
+                                                start_utc,
+                                                video_cfg.video_width,
+                                                video_cfg.video_height,
+                                                video_cfg.video_fps,
+                                                &video_cfg.video_encoder,
+                                            ) {
+                                                // Write initial frame immediately so PART001.mp4 has content
+                                                let rgb = render_plane_plot_rgb24(
+                                                    vid.width(),
+                                                    vid.height(),
+                                                    &video_cfg.viewport,
+                                                    &video_cfg.ego,
+                                                    &video_cfg.xy_layers,
+                                                    &worker_signals_by_name,
+                                                    &worker_trails_by_layer,
+                                                );
+                                                let _ = vid.write_rgb24_frame(&rgb);
+                                                active_video_file = Some(vid.current_file_path());
+                                                video_recorder_opt = Some(vid);
+                                                last_video_frame_instant = Instant::now();
+                                            }
+                                        }
                                         recorder_opt = Some(rec);
                                         let _ = evt_tx.send(WorkerEvent::RecordingStarted {
                                             active_file,
+                                            active_video_file,
                                             start_utc_human,
                                         });
                                     }
@@ -601,14 +1252,18 @@ fn run_background_worker(cmd_rx: Receiver<WorkerCommand>, evt_tx: Sender<WorkerE
                         }
                     }
                     WorkerCommand::StopRecording => {
-                        if let Some(client) = &active_client {
-                            let _ = client.stop_daq().await;
-                        }
+                        let completed_video_files = if let Some(mut vid) = video_recorder_opt.take()
+                        {
+                            vid.finish().unwrap_or_default()
+                        } else {
+                            Vec::new()
+                        };
                         if let Some(mut rec) = recorder_opt.take() {
                             match rec.finish() {
                                 Ok(files) => {
                                     let _ = evt_tx.send(WorkerEvent::RecordingStopped {
                                         completed_files: files,
+                                        completed_video_files,
                                     });
                                 }
                                 Err(e) => {
@@ -676,6 +1331,9 @@ fn run_background_worker(cmd_rx: Receiver<WorkerCommand>, evt_tx: Sender<WorkerE
                         if let Some(mut rec) = recorder_opt.take() {
                             let _ = rec.finish();
                         }
+                        if let Some(mut vid) = video_recorder_opt.take() {
+                            let _ = vid.finish();
+                        }
                         if let Some(client) = active_client.take() {
                             let _ = client.disconnect().await;
                         }
@@ -685,14 +1343,11 @@ fn run_background_worker(cmd_rx: Receiver<WorkerCommand>, evt_tx: Sender<WorkerE
                 }
             }
 
-            // Drain incoming DAQ DTO packets if recording is active
+            // Drain incoming DAQ DTO packets (both during Live monitoring and during Recording)
             let mut processed_any = false;
-            if let (Some(rx), Some(planner), Some(model), Some(rec)) = (
-                &mut daq_rx_opt,
-                &mut active_planner,
-                &active_model,
-                &mut recorder_opt,
-            ) {
+            if let (Some(rx), Some(planner), Some(model)) =
+                (&mut daq_rx_opt, &mut active_planner, &active_model)
+            {
                 while let Ok(dto) = rx.try_recv() {
                     processed_any = true;
                     if let Some(sample) = planner.process_dto_packet(
@@ -702,21 +1357,44 @@ fn run_background_worker(cmd_rx: Receiver<WorkerCommand>, evt_tx: Sender<WorkerE
                         model,
                         &mut active_clock_sync,
                     ) {
-                        if let Ok(Some(completed_part)) = rec.record_event_sample(&sample) {
-                            let _ = evt_tx.send(WorkerEvent::RecordingPartSplit {
-                                completed_file: completed_part,
-                                new_active_file: rec.current_file_path(),
-                                new_part_number: rec.current_part(),
-                            });
+                        for (&m_idx, val) in &sample.values {
+                            if let Some(m) = model.measurements.get(m_idx) {
+                                worker_signals_by_name.insert(m.name.clone(), val.clone());
+                            }
                         }
-                        let _ = evt_tx.send(WorkerEvent::RecordingProgress {
-                            active_file: rec.current_file_path(),
-                            part_number: rec.current_part(),
-                            current_part_bytes: rec.current_part_bytes(),
-                            max_part_bytes: rec.max_part_bytes(),
-                            total_samples: rec.total_samples_recorded(),
-                            latest_sample: sample,
-                        });
+                        update_trails_for_layers(
+                            &video_cfg.xy_layers,
+                            &worker_signals_by_name,
+                            &mut worker_trails_by_layer,
+                        );
+
+                        if let Some(rec) = &mut recorder_opt {
+                            let emit_video_frame = video_recorder_opt
+                                .as_ref()
+                                .map(|vid| {
+                                    let interval =
+                                        Duration::from_secs_f64(1.0 / (vid.fps().max(1) as f64));
+                                    last_video_frame_instant.elapsed() >= interval
+                                })
+                                .unwrap_or(false);
+                            if emit_video_frame {
+                                last_video_frame_instant = Instant::now();
+                            }
+                            record_synchronized_daq_and_video_sample(
+                                rec,
+                                &mut video_recorder_opt,
+                                emit_video_frame,
+                                &video_cfg.viewport,
+                                &video_cfg.ego,
+                                &video_cfg.xy_layers,
+                                &worker_signals_by_name,
+                                &worker_trails_by_layer,
+                                sample,
+                                &evt_tx,
+                            );
+                        } else {
+                            let _ = evt_tx.send(WorkerEvent::LiveSample(sample));
+                        }
                     }
                 }
             }

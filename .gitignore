@@ -29,6 +29,7 @@ tarpaulin-report.*
 cobertura.xml
 
 # IDE & OS files
+/temp/
 .vscode/
 .idea/
 *.swp
