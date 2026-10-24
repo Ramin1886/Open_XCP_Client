@@ -13,6 +13,7 @@ use crate::recording::video_recorder::{
     extract_polygons_for_layer, extract_xy_points_for_layer, PlaneViewport,
 };
 use crate::ui::axis_ticks::{grid_steps, is_major, tick_text, ticks};
+use crate::ui::profile_panel::{render_profile_collapsing, UNRESOLVED_COLOR};
 use egui::{Align2, Color32, FontId, Pos2, RichText, Sense, Stroke, Ui, Vec2};
 
 /// Renders the `2D Live Plot` tab (`ActiveTab::PlanePlot`).
@@ -90,6 +91,15 @@ pub fn format_canvas_hover_tooltip(
     }
 }
 
+/// Returns the `⚠ ` prefix for a signal label when that signal is unresolved.
+fn marker(missing: bool) -> &'static str {
+    if missing {
+        "⚠ "
+    } else {
+        ""
+    }
+}
+
 /// Adds a new [`XyPlotLayerConfig`] from the current builder fields on [`AppController`].
 pub fn add_xy_layer_from_inputs(controller: &mut AppController) -> bool {
     if controller.new_layer_x_signal.trim().is_empty()
@@ -121,11 +131,14 @@ pub fn add_xy_layer_from_inputs(controller: &mut AppController) -> bool {
             point_radius: 5.5,
         });
     controller.sync_video_scene_to_worker();
+    controller.persist_visualization();
     true
 }
 
 fn render_layer_sidebar(ui: &mut Ui, controller: &mut AppController) {
     egui::ScrollArea::vertical().show(ui, |ui| {
+        render_profile_collapsing(ui, controller);
+        ui.separator();
         ui.heading(RichText::new("2D View & Ego Vehicle").strong());
         let mut scene_changed = false;
 
@@ -169,6 +182,7 @@ fn render_layer_sidebar(ui: &mut Ui, controller: &mut AppController) {
         ui.separator();
         ui.heading(RichText::new("Active (X, Y) Signal Layers").strong());
 
+        let unresolved = controller.unresolved_profile_signals.clone();
         let mut remove_idx: Option<usize> = None;
         for (idx, layer) in controller
             .settings
@@ -177,6 +191,8 @@ fn render_layer_sidebar(ui: &mut Ui, controller: &mut AppController) {
             .iter_mut()
             .enumerate()
         {
+            let x_missing = unresolved.contains(&layer.x_signal);
+            let y_missing = unresolved.contains(&layer.y_signal);
             ui.group(|ui| {
                 ui.horizontal(|ui| {
                     if ui.checkbox(&mut layer.enabled, "").changed() {
@@ -185,7 +201,18 @@ fn render_layer_sidebar(ui: &mut Ui, controller: &mut AppController) {
                     if ui.color_edit_button_srgb(&mut layer.color_rgb).changed() {
                         scene_changed = true;
                     }
-                    ui.label(RichText::new(&layer.name).strong());
+                    let title = if x_missing || y_missing {
+                        RichText::new(format!("⚠ {}", layer.name))
+                            .color(UNRESOLVED_COLOR)
+                            .strong()
+                    } else {
+                        RichText::new(&layer.name).strong()
+                    };
+                    ui.label(title).on_hover_text(if x_missing || y_missing {
+                        "One or more of this layer's signals is not in the current A2L"
+                    } else {
+                        "Layer signals resolve against the current A2L"
+                    });
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         if ui.small_button("✖").on_hover_text("Remove layer").clicked() {
                             remove_idx = Some(idx);
@@ -193,8 +220,8 @@ fn render_layer_sidebar(ui: &mut Ui, controller: &mut AppController) {
                         ui.weak(layer.style.label());
                     });
                 });
-                ui.monospace(format!("X: {}", layer.x_signal));
-                ui.monospace(format!("Y: {}", layer.y_signal));
+                ui.monospace(format!("{}X: {}", marker(x_missing), layer.x_signal));
+                ui.monospace(format!("{}Y: {}", marker(y_missing), layer.y_signal));
                 if !layer.valid_count_signal.is_empty() {
                     ui.weak(format!("Valid N: {}", layer.valid_count_signal));
                 }
@@ -203,6 +230,7 @@ fn render_layer_sidebar(ui: &mut Ui, controller: &mut AppController) {
 
         if let Some(idx) = remove_idx {
             controller.settings.visualization.xy_layers.remove(idx);
+            controller.persist_visualization();
             scene_changed = true;
         }
 
@@ -321,6 +349,7 @@ fn render_layer_sidebar(ui: &mut Ui, controller: &mut AppController) {
 
         if scene_changed {
             controller.sync_video_scene_to_worker();
+            controller.persist_visualization();
         }
     });
 }

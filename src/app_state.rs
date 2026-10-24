@@ -10,6 +10,7 @@ use crate::config_store::{
     AppSettings, ConfigStore, EgoVehicleSettings, XyDrawStyle, XyPlotLayerConfig,
 };
 use crate::mock_server::MockXcpServer;
+use crate::plot_profile::{PlotProfile, ProfileStore, ProfileSummary};
 use crate::recording::file_namer::format_utc_for_filename;
 use crate::recording::sdf_writer::SdfSessionRecorder;
 use crate::recording::video_recorder::{
@@ -20,9 +21,9 @@ use crate::xcp::client::XcpClient;
 use crate::xcp::daq_planner::{DaqEventSample, DaqPlanner, DecodedValue};
 use chrono::Utc;
 use crossbeam_channel::{unbounded, Receiver, Sender};
-use std::collections::{BTreeMap, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::net::SocketAddr;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 /// Rolling time-series history retention window in seconds (`120.0 s`).
@@ -355,6 +356,16 @@ pub struct AppController {
     pub replay_file_input: String,
     pub last_replay_tick: Instant,
 
+    // Plot profiles (./config/profiles/<Name>.json)
+    pub profile_store: ProfileStore,
+    pub profile_list: Vec<ProfileSummary>,
+    pub selected_profile: String,
+    pub new_profile_name: String,
+    pub new_profile_description: String,
+    pub profile_io_path: String,
+    pub unresolved_profile_signals: BTreeSet<String>,
+    profile_applied: bool,
+
     // Status bar
     pub status_message: String,
 
@@ -364,7 +375,18 @@ pub struct AppController {
 
 impl AppController {
     /// Creates a new `AppController` backed by `config_store` and spawns the background worker thread.
+    ///
+    /// Uses the default plot profile directory; see [`AppController::new_with_profile_store`] to
+    /// point the profile store elsewhere.
     pub fn new(config_store: ConfigStore) -> Self {
+        Self::new_with_profile_store(config_store, ProfileStore::default())
+    }
+
+    /// Creates a new `AppController` with an explicit [`ProfileStore`] (used by tests).
+    ///
+    /// After construction, the profile named by `settings.active_profile` is loaded and applied,
+    /// so the last-used measurement view is restored across sessions.
+    pub fn new_with_profile_store(config_store: ConfigStore, profile_store: ProfileStore) -> Self {
         let settings = config_store.load_or_default().unwrap_or_default();
         let (cmd_tx, cmd_rx) = unbounded::<WorkerCommand>();
         let (evt_tx, evt_rx) = unbounded::<WorkerEvent>();
@@ -378,7 +400,7 @@ impl AppController {
         let log_prefix_input = settings.recording.default_file_prefix.clone();
         let max_part_bytes = settings.max_logfile_size_bytes();
 
-        Self {
+        let mut controller = Self {
             config_store,
             settings,
             mode: AppMode::Live,
@@ -424,10 +446,29 @@ impl AppController {
             replay_player: None,
             replay_file_input: String::new(),
             last_replay_tick: Instant::now(),
+            profile_store,
+            profile_list: Vec::new(),
+            selected_profile: String::new(),
+            new_profile_name: String::new(),
+            new_profile_description: String::new(),
+            profile_io_path: String::new(),
+            unresolved_profile_signals: BTreeSet::new(),
+            profile_applied: false,
             status_message: "Ready — Configure target in Settings or click Connect.".to_string(),
             cmd_tx,
             evt_rx,
+        };
+
+        controller.refresh_profile_list();
+        let active = controller.settings.active_profile.trim().to_string();
+        if !active.is_empty() {
+            controller.selected_profile = active.clone();
+            if let Err(err) = controller.load_profile_by_name(&active) {
+                controller.status_message =
+                    format!("Could not restore plot profile '{}': {}", active, err);
+            }
         }
+        controller
     }
 
     /// Switches between `AppMode::Live` and `AppMode::Replay`.
@@ -519,6 +560,9 @@ impl AppController {
 
     /// Populates sensible default 2D XY Plot layers and Time Plot signals when an A2L model
     /// is loaded for the first time and the user's configuration lists are empty.
+    ///
+    /// Seeding is skipped once a plot profile has been applied, so an intentionally empty
+    /// profile is never overwritten by the heuristic.
     pub fn init_default_layers_and_plots_for_model(&mut self, model: &A2lModel) {
         for (&ev_id, ev) in &model.events {
             self.event_telemetry.entry(ev_id).or_insert_with(|| {
@@ -541,7 +585,10 @@ impl AppController {
             }
         }
 
-        if self.settings.visualization.xy_layers.is_empty() && model.measurements.len() >= 2 {
+        if !self.profile_applied
+            && self.settings.visualization.xy_layers.is_empty()
+            && model.measurements.len() >= 2
+        {
             // Try to pair x/dist with y/lat if present, otherwise pair first two signals
             let x_cand = model
                 .measurements
@@ -576,7 +623,7 @@ impl AppController {
                 });
         }
 
-        if self.settings.visualization.time_plot_signals.is_empty() {
+        if !self.profile_applied && self.settings.visualization.time_plot_signals.is_empty() {
             for m in model.measurements.iter().take(4) {
                 self.settings
                     .visualization
@@ -584,6 +631,9 @@ impl AppController {
                     .push(m.name.clone());
             }
         }
+
+        // Now that an A2L model is known, re-check which profile signals it actually resolves.
+        self.recompute_unresolved_profile_signals(model);
     }
 
     /// Ingests a decoded [`DaqEventSample`] into all live/replay visualization buffers:
@@ -704,6 +754,211 @@ impl AppController {
             self.settings.recording.max_logfile_size_mb
         );
         Ok(())
+    }
+
+    /// Persists the current visualization state (2D layers, Time Plot selection, Ego/axes)
+    /// to `./config/settings.json` on a best-effort basis.
+    ///
+    /// Called from the plot sidebars so a view survives application exit without the user
+    /// having to open `⚙ Settings` and click Save.
+    pub fn persist_visualization(&mut self) {
+        if let Err(err) = self.save_settings() {
+            self.status_message = format!("Could not persist plot settings: {}", err);
+        }
+    }
+
+    /// Re-reads the profile directory into [`AppController::profile_list`].
+    pub fn refresh_profile_list(&mut self) {
+        match self.profile_store.list() {
+            Ok(list) => self.profile_list = list,
+            Err(err) => {
+                self.profile_list.clear();
+                self.status_message = format!("Could not list plot profiles: {}", err);
+            }
+        }
+    }
+
+    /// Recomputes which signals referenced by the active profile are absent from `model`.
+    pub fn recompute_unresolved_profile_signals(&mut self, model: &A2lModel) {
+        let profile =
+            self.capture_current_profile(self.settings.active_profile.clone(), String::new());
+        self.unresolved_profile_signals = profile.unresolved_signals(model);
+    }
+
+    /// Snapshots the current measurement view into a [`PlotProfile`].
+    pub fn capture_current_profile(&self, name: String, description: String) -> PlotProfile {
+        let (a2l_project, a2l_module) = self
+            .a2l_model
+            .as_ref()
+            .map(|m| (m.project_name.clone(), m.module_name.clone()))
+            .unwrap_or_default();
+
+        PlotProfile {
+            format_version: crate::plot_profile::PROFILE_FORMAT_VERSION,
+            name,
+            description,
+            created_utc: Utc::now().to_rfc3339(),
+            a2l_project,
+            a2l_module,
+            ego: self.settings.visualization.ego.clone(),
+            xy_layers: self.settings.visualization.xy_layers.clone(),
+            time_plot_signals: self.settings.visualization.time_plot_signals.clone(),
+            time_plot_window_s: self.settings.visualization.time_plot_window_s,
+            calibration_watch_list: self.calibration_manager.watch_list_names(),
+            viewport: Some(self.plane_viewport),
+        }
+    }
+
+    /// Captures the current view and saves it as the profile `name`, making it the active profile.
+    pub fn save_current_as_profile(
+        &mut self,
+        name: &str,
+        description: &str,
+    ) -> Result<PathBuf, String> {
+        let profile =
+            self.capture_current_profile(name.trim().to_string(), description.trim().to_string());
+        let path = self
+            .profile_store
+            .save(&profile)
+            .map_err(|e| e.to_string())?;
+        self.settings.active_profile = profile.name.clone();
+        self.selected_profile = profile.name.clone();
+        self.profile_applied = true;
+        self.refresh_profile_list();
+        self.save_settings()?;
+        self.status_message = format!(
+            "Plot profile '{}' saved to {} ({} layer(s), {} Time Plot signal(s))",
+            profile.name,
+            path.display(),
+            profile.xy_layers.len(),
+            profile.time_plot_signals.len()
+        );
+        Ok(path)
+    }
+
+    /// Applies `profile` to the live view: 2D layers, Time Plot selection, Ego geometry,
+    /// viewport framing and the Calibration watch-list.
+    ///
+    /// Signals absent from the current A2L are kept in the profile and reported through
+    /// [`AppController::unresolved_profile_signals`] rather than being discarded.
+    pub fn apply_profile(&mut self, profile: &PlotProfile) {
+        self.settings.visualization.ego = profile.ego.clone();
+        self.settings.visualization.xy_layers = profile.xy_layers.clone();
+        self.settings.visualization.time_plot_signals = profile.time_plot_signals.clone();
+        self.settings.visualization.time_plot_window_s = profile.time_plot_window_s;
+        self.plane_viewport = profile.viewport.unwrap_or_default();
+        self.trails_by_layer.clear();
+
+        // Loading a profile replaces the watch-list rather than accumulating onto it.
+        self.calibration_manager.clear();
+        for name in &profile.calibration_watch_list {
+            self.add_calibration_variable(name);
+        }
+        self.settings.calibration.watch_list = profile.calibration_watch_list.clone();
+
+        self.unresolved_profile_signals = match &self.a2l_model {
+            Some(model) => profile.unresolved_signals(model),
+            None => BTreeSet::new(),
+        };
+
+        self.settings.active_profile = profile.name.clone();
+        self.selected_profile = profile.name.clone();
+        self.profile_applied = true;
+        self.sync_video_scene_to_worker();
+        if let Err(err) = self.save_settings() {
+            self.status_message = format!("Could not persist active profile: {}", err);
+            return;
+        }
+
+        let unresolved = self.unresolved_profile_signals.len();
+        self.status_message = if unresolved == 0 {
+            format!(
+                "Plot profile '{}' applied ({} layer(s), {} Time Plot signal(s))",
+                profile.name,
+                profile.xy_layers.len(),
+                profile.time_plot_signals.len()
+            )
+        } else {
+            format!(
+                "Plot profile '{}' applied ({} layer(s), {} Time Plot signal(s)) — {} signal(s) not in the current A2L (kept)",
+                profile.name,
+                profile.xy_layers.len(),
+                profile.time_plot_signals.len(),
+                unresolved
+            )
+        };
+    }
+
+    /// Loads the profile called `name` from the profile directory and applies it.
+    pub fn load_profile_by_name(&mut self, name: &str) -> Result<(), String> {
+        let profile = self.profile_store.load(name).map_err(|e| e.to_string())?;
+        self.apply_profile(&profile);
+        Ok(())
+    }
+
+    /// Imports a profile from an explicit file path, applies it, and copies it into the
+    /// profile directory so it appears in the selector.
+    pub fn import_profile_from_path(&mut self, path: &str) -> Result<(), String> {
+        let trimmed = path.trim();
+        if trimmed.is_empty() {
+            return Err("Enter a path to a profile .json file".to_string());
+        }
+        let profile = self
+            .profile_store
+            .load_from_path(Path::new(trimmed))
+            .map_err(|e| e.to_string())?;
+        self.profile_store
+            .save(&profile)
+            .map_err(|e| e.to_string())?;
+        self.apply_profile(&profile);
+        self.refresh_profile_list();
+        Ok(())
+    }
+
+    /// Exports the current view to an explicit file path, without changing the active profile.
+    pub fn export_current_profile_to_path(&mut self, path: &str) -> Result<(), String> {
+        let trimmed = path.trim();
+        if trimmed.is_empty() {
+            return Err("Enter a destination path for the exported profile".to_string());
+        }
+        let name = if self.settings.active_profile.trim().is_empty() {
+            Path::new(trimmed)
+                .file_stem()
+                .and_then(|s| s.to_str())
+                .unwrap_or("Profile")
+                .to_string()
+        } else {
+            self.settings.active_profile.clone()
+        };
+        let profile =
+            self.capture_current_profile(name, self.new_profile_description.trim().to_string());
+        self.profile_store
+            .save_to_path(&profile, Path::new(trimmed))
+            .map_err(|e| e.to_string())?;
+        self.status_message = format!("Plot profile exported to {}", trimmed);
+        Ok(())
+    }
+
+    /// Deletes the profile called `name`, clearing the active-profile pointer when it matches.
+    pub fn delete_profile(&mut self, name: &str) -> Result<(), String> {
+        self.profile_store.delete(name).map_err(|e| e.to_string())?;
+        if self.settings.active_profile == name {
+            self.settings.active_profile.clear();
+            self.profile_applied = false;
+            self.unresolved_profile_signals.clear();
+            let _ = self.save_settings();
+        }
+        if self.selected_profile == name {
+            self.selected_profile.clear();
+        }
+        self.refresh_profile_list();
+        self.status_message = format!("Plot profile '{}' deleted", name);
+        Ok(())
+    }
+
+    /// Returns `true` when `signal` is referenced by the active profile but absent from the A2L.
+    pub fn is_signal_unresolved(&self, signal: &str) -> bool {
+        self.unresolved_profile_signals.contains(signal)
     }
 
     /// Requests connection to the configured XCP target (or built-in mock server).

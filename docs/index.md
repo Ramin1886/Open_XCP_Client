@@ -28,7 +28,11 @@ Welcome to the official technical documentation for **Open_XCP_Client**. Every m
    - Top navigation bar (`Live` / `Replay` switch), Recording Bar, Replay Transport Bar, and **`⚙ Settings`** modal.
    - Operating the **2D Live Plot**, **Numerical**, **Time Plot**, **Calibration**, and **XCP Info** tabs.
    - Configurable Ego vehicle footprint and interactive `(X, Y)` scalar/vector signal pairing.
-7. [**CI/CD Pipelines, Release Packaging & Test Coverage**](./ci_cd_and_packaging.md)
+7. [**Plot Profiles — Predefined, Reusable Measurement Views**](./plot_profiles.md)
+   - JSON (not XML) settings layout: `./config/settings.json` and `./config/profiles/<Name>.json`.
+   - Defining, saving, loading, updating, importing and exporting a named measurement view.
+   - Behavior when a profile is loaded against an A2L that lacks some of its signals.
+8. [**CI/CD Pipelines, Release Packaging & Test Coverage**](./ci_cd_and_packaging.md)
    - GitHub Actions workflows (`ci.yml` and `release.yml`).
    - Running tests and verifying $\ge 95\%$ source code coverage.
 
@@ -39,11 +43,12 @@ Welcome to the official technical documentation for **Open_XCP_Client**. Every m
 - [`src/lib.rs`](../src/lib.rs) — Library root
 - [`src/main.rs`](../src/main.rs) — Native GUI & headless self-check binary entry point
 - [`src/config_store.rs`](../src/config_store.rs) — Persistent JSON settings store
+- [`src/plot_profile.rs`](../src/plot_profile.rs) — Named, reusable plot profiles (`./config/profiles/`)
 - [`src/app_state.rs`](../src/app_state.rs) — UI controller & background worker orchestration
 - [`src/a2l/`](../src/a2l/mod.rs) — A2L lexer, parser, structure resolver, and conversion rules
 - [`src/xcp/`](../src/xcp/mod.rs) — XCP packet framing, UDP/TCP transport, DAQ planner, and clock sync
 - [`src/recording/`](../src/recording/mod.rs) — `.sdf` (HDF5 v2) writer/reader, `.mp4` video recorder, file namer, and size splitter
 - [`src/replay/`](../src/replay/mod.rs) — Multi-part `.sdf` recording replay engine
 - [`src/calibration/`](../src/calibration/mod.rs) — Calibration validator and active watch-list manager
-- [`src/ui/`](../src/ui/mod.rs) — `egui`/`eframe` user interface components (5 tabs + top bar + settings)
+- [`src/ui/`](../src/ui/mod.rs) — `egui`/`eframe` user interface components (5 tabs + top bar + settings + plot profile selector)
 - [`src/mock_server/`](../src/mock_server/mod.rs) — Mock `xcplite` 2.2.2 server & sample ADAS A2L

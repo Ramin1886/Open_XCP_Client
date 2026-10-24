@@ -26,6 +26,7 @@
     "dark_mode": true,
     "enable_mock_server": false
   },
+  "active_profile": "",
   "visualization": {
     "ego": {
       "length_m": 4.85,

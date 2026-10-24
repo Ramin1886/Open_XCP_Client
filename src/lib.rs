@@ -7,6 +7,7 @@ pub mod app_state;
 pub mod calibration;
 pub mod config_store;
 pub mod mock_server;
+pub mod plot_profile;
 pub mod recording;
 pub mod replay;
 pub mod ui;

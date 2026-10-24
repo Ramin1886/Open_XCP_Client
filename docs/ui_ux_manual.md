@@ -10,11 +10,21 @@
    - **5-Tab Switcher**: **`📐 2D Live Plot`** (`Ctrl+1`), **`🔢 Numerical`** (`Ctrl+2`), **`📈 Time Plot`** (`Ctrl+3`), **`🎛 Calibration`** (`Ctrl+4`), and **`📡 XCP Info`** (`Ctrl+5`)
    - **Context Bar**: Live Recording Bar (Folder, Prefix, MP4 toggle, FPS, `⏺ Start / ⏹ Stop Recording`) in `Live` mode, or `.sdf` Replay Transport Bar (`.sdf` loader, `▶ Play / ⏸ Pause`, `■ Stop`, Speed `0.25×..10× / max`, continuous Time Slider) in `Replay` mode
    - **`⚙ Settings` Button** ([`src/ui/settings_menu.rs`](../src/ui/settings_menu.rs))
+   - **`📁 Plot Profiles`** selector in the `2D Live Plot` and `Time Plot` sidebars ([`src/ui/profile_panel.rs`](../src/ui/profile_panel.rs))
 2. **Tab 1 — `📐 2D Live Plot`** ([`src/ui/plane_plot_tab.rs`](../src/ui/plane_plot_tab.rs))
 3. **Tab 2 — `🔢 Numerical`** ([`src/ui/numerical_tab.rs`](../src/ui/numerical_tab.rs))
 4. **Tab 3 — `📈 Time Plot`** ([`src/ui/time_plot_tab.rs`](../src/ui/time_plot_tab.rs))
 5. **Tab 4 — `🎛 Calibration`** ([`src/ui/calibration_tab.rs`](../src/ui/calibration_tab.rs))
 6. **Tab 5 — `📡 XCP Info`** ([`src/ui/xcp_info_tab.rs`](../src/ui/xcp_info_tab.rs))
+
+---
+
+## 0. Plot Profiles (Predefined Measurement Views)
+
+- The **`📁 Plot Profiles`** header at the top of the `2D Live Plot` and `Time Plot` sidebars (and the `Plot Profiles` section in **`⚙ Settings`**) stores a complete measurement view — the 2D `(X, Y)` layers, the Time Plot selection and window, the Ego geometry, the 2D viewport framing and the calibration watch-list — as one JSON file in `./config/profiles/<Name>.json`.
+- Build a view, type a name, and click **`💾 Save Current View As Profile`**; in a later session pick it in the selector and click **`📂 Load`**. The last profile applied is re-applied automatically on the next start.
+- **`🔁 Update`** overwrites the selected profile, **`🗑 Delete`** removes it, and **`⤵ Import`** / **`⤴ Export`** read or write a profile at any path for sharing.
+- Signals a profile references that the current A2L does not define are marked with **`⚠`** and kept, never dropped. See the [Plot Profiles guide](./plot_profiles.md).
 
 ---
 
@@ -29,6 +39,7 @@
   - In **`⚙ Settings`**, configure **Ego Length (m)** (default `4.85`), **Ego Width (m)** (default `1.90`), and **Rear-Axle to Center (m)** (default `1.425`).
 - **Pairing `(X, Y)` Signals (Scalar, Vector, Broadcast & Polygons)**:
   - Use the **Filter A2L Signals** box in the left sidebar to search all measurements.
+  - A layer whose `X` or `Y` signal is absent from the current A2L (after loading a profile captured against a different build) is shown in amber with a **`⚠`**; it stays in the layer list.
   - Click **`Set X`** and **`Set Y`** next to any measurement (or type the signal names directly), choose a **Style** (`Points / Scatter`, `Connected Line`, `History Trail`, or `4-Corner Polygon (P0..P3)`), pick a color, and click **`➕ Add (X, Y) Layer to 2D Plot`**.
   - Works seamlessly whether `X` and `Y` are both scalars, both 1D/N-D arrays (`MATRIX_DIM`), or one scalar and one vector (automatic broadcast), with optional **Valid Count** truncation.
 
@@ -45,7 +56,7 @@
 
 ## 3. Operating the `Time Plot` Tab (`Ctrl+3`)
 
-- In the left panel, filter and check up to 12 signals (`☑`) to plot in the 2-column strip-chart grid.
+- In the left panel, filter and check up to 12 signals (`☑`) to plot in the 2-column strip-chart grid. Signals selected by the active profile but missing from the current A2L are listed above the picker with a **`⚠`**.
 - Select a time window preset (**`10 s`**, **`20 s`**, **`60 s`**, **`120 s`**) or hover any chart and scroll the mouse wheel to zoom the time window (`1..120 s`) anchored at the newest sample on the right edge.
 - Double-click any chart to reset the time window to `20 s`, or click **`❄ Freeze`** to pause trace updates for inspection.
 

@@ -8,6 +8,7 @@
 
 use crate::app_state::AppController;
 use crate::ui::axis_ticks::{grid_steps, tick_text, ticks};
+use crate::ui::profile_panel::{render_profile_collapsing, UNRESOLVED_COLOR};
 use egui::{Align2, Color32, FontId, Pos2, RichText, ScrollArea, Sense, Stroke, Ui, Vec2};
 
 /// Maximum number of simultaneous strip charts in the Time Plot grid.
@@ -51,6 +52,7 @@ pub fn reset_time_plot_signals_to_defaults(controller: &mut AppController) {
                 .push(m.name.clone());
         }
     }
+    controller.persist_visualization();
 }
 
 /// Toggles whether `sig_name` is included in `time_plot_signals` (up to [`MAX_TIME_PLOT_SIGNALS`]).
@@ -67,9 +69,12 @@ pub fn set_time_plot_signal_selected(
     } else {
         list.retain(|s| s != sig_name);
     }
+    controller.persist_visualization();
 }
 
 fn render_signal_picker(ui: &mut Ui, controller: &mut AppController) {
+    render_profile_collapsing(ui, controller);
+    ui.separator();
     ui.heading(RichText::new("Time Plot Signals").strong());
     ui.horizontal(|ui| {
         if ui.button("Defaults").clicked() {
@@ -77,6 +82,7 @@ fn render_signal_picker(ui: &mut Ui, controller: &mut AppController) {
         }
         if ui.button("Clear").clicked() {
             controller.settings.visualization.time_plot_signals.clear();
+            controller.persist_visualization();
         }
         ui.weak(format!(
             "{}/{}",
@@ -104,6 +110,29 @@ fn render_signal_picker(ui: &mut Ui, controller: &mut AppController) {
                 .iter()
                 .map(|m| (m.name.clone(), m.description.clone()))
                 .collect();
+
+            let unresolved: Vec<String> = controller
+                .unresolved_profile_signals
+                .iter()
+                .filter(|s| {
+                    controller
+                        .settings
+                        .visualization
+                        .time_plot_signals
+                        .iter()
+                        .any(|sel| sel == *s)
+                })
+                .cloned()
+                .collect();
+            for missing in &unresolved {
+                ui.label(RichText::new(format!("⚠ {}", missing)).color(UNRESOLVED_COLOR))
+                    .on_hover_text(
+                        "Selected by the active plot profile but not present in the current A2L",
+                    );
+            }
+            if !unresolved.is_empty() {
+                ui.separator();
+            }
 
             for (name, desc) in names {
                 if !filter.is_empty()
@@ -143,6 +172,7 @@ fn render_strip_charts(ui: &mut Ui, controller: &mut AppController) {
                 .clicked()
             {
                 controller.settings.visualization.time_plot_window_s = win_s;
+                controller.persist_visualization();
             }
         }
         ui.weak(format!(
