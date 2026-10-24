@@ -4,7 +4,9 @@
 
 use open_xcp_client::a2l::compu_method::{apply_physical_to_raw, apply_raw_to_physical};
 use open_xcp_client::a2l::lexer::{parse_i64_literal, parse_u64_literal, tokenize_a2l, A2lToken};
-use open_xcp_client::a2l::model::{A2lDataType, CharacteristicType, CompuMethod, CompuType};
+use open_xcp_client::a2l::model::{
+    A2lDataType, CharacteristicType, CompuMethod, CompuType, MAX_ELEMENTS_PER_SIGNAL,
+};
 use open_xcp_client::a2l::parser::{parse_a2l, A2lParseError};
 use open_xcp_client::a2l::struct_resolver::split_hierarchical_segments;
 use open_xcp_client::mock_server::sample_adas_a2l::sample_adas_a2l_text;
@@ -261,4 +263,39 @@ fn test_a2l_extended_constructs_and_edge_cases() {
     };
     assert_eq!(apply_raw_to_physical(&cm_nonlin, 7.0), 7.0);
     assert_eq!(apply_physical_to_raw(&cm_nonlin, 7.0), 7.0);
+}
+
+#[test]
+fn test_absurd_matrix_dims_are_clamped_instead_of_overflowing() {
+    // An A2L uploaded from the target is untrusted input: a measurement declaring a
+    // 100000 x 100000 x 100000 array must neither overflow the element product nor request
+    // terabytes of staging memory. The count saturates at MAX_ELEMENTS_PER_SIGNAL.
+    let text = r#"
+/begin PROJECT Hostile ""
+  /begin MODULE Hostile ""
+    /begin MEASUREMENT Huge "" UBYTE NO_COMPU_METHOD 0 0 0 255
+      ECU_ADDRESS 0x1000
+      MATRIX_DIM 100000 100000 100000
+    /end MEASUREMENT
+    /begin MEASUREMENT Small "" UBYTE NO_COMPU_METHOD 0 0 0 255
+      ECU_ADDRESS 0x2000
+      MATRIX_DIM 4 8
+    /end MEASUREMENT
+  /end MODULE
+/end PROJECT
+"#;
+    let model = parse_a2l(text).expect("hostile dims must still parse");
+    let huge = model
+        .measurements
+        .iter()
+        .find(|m| m.name == "Huge")
+        .expect("Huge present");
+    assert_eq!(huge.element_count(), MAX_ELEMENTS_PER_SIGNAL);
+    assert_eq!(huge.total_byte_size(), MAX_ELEMENTS_PER_SIGNAL);
+    let small = model
+        .measurements
+        .iter()
+        .find(|m| m.name == "Small")
+        .expect("Small present");
+    assert_eq!(small.element_count(), 32, "ordinary dims are untouched");
 }

@@ -5,7 +5,7 @@ use crate::a2l::lexer::{parse_i64_literal, parse_u64_literal, tokenize_a2l, A2lT
 use crate::a2l::model::{
     A2lDataType, A2lEvent, A2lModel, Characteristic, CharacteristicType, CompuMethod, CompuType,
     Instance, Measurement, StructureComponent, TypedefCharacteristic, TypedefMeasurement,
-    TypedefStructure,
+    TypedefStructure, MAX_ELEMENTS_PER_SIGNAL,
 };
 use crate::a2l::struct_resolver::{build_measurement_hierarchy, resolve_a2l_structures};
 use std::collections::BTreeMap;
@@ -19,7 +19,13 @@ fn consume_matrix_dims(body: &[A2lToken<'_>], start: usize, out: &mut Vec<usize>
         match parse_u64_literal(body[idx].as_str()) {
             Some(dim) => {
                 if dim > 0 {
-                    out.push(dim as usize);
+                    // Clamp each dimension so a hostile or broken A2L cannot request absurd
+                    // element counts; the product is bounded again in `element_count()`.
+                    out.push(
+                        usize::try_from(dim)
+                            .unwrap_or(usize::MAX)
+                            .min(MAX_ELEMENTS_PER_SIGNAL),
+                    );
                 }
                 idx += 1;
             }

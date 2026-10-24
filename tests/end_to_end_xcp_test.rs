@@ -14,7 +14,7 @@ use open_xcp_client::calibration::{
 use open_xcp_client::config_store::{ConfigStore, TransportProtocol};
 use open_xcp_client::mock_server::MockXcpServer;
 use open_xcp_client::recording::{SdfFileReader, SdfSessionRecorder};
-use open_xcp_client::xcp::client::XcpClient;
+use open_xcp_client::xcp::client::{XcpClient, MAX_UPLOAD_BYTES};
 use open_xcp_client::xcp::daq_planner::DaqPlanner;
 use open_xcp_client::xcp::daq_planner::DTO_HEADER_RESERVE_BYTES;
 use std::time::Duration;
@@ -38,6 +38,16 @@ async fn run_full_protocol_flow(protocol: TransportProtocol) {
         .await
         .expect("Should upload A2L from target");
     let model = parse_a2l(&a2l_text).expect("Uploaded A2L should parse cleanly");
+
+    // A length announced by the target must never size an allocation unchecked.
+    let too_big = client
+        .upload_from_current_mta(MAX_UPLOAD_BYTES + 1)
+        .await
+        .expect_err("an upload above the safety limit must be refused");
+    assert!(
+        too_big.to_string().contains("safety limit"),
+        "unexpected error: {too_big}"
+    );
     assert!(model.measurements.len() >= 10);
     assert!(model.characteristics.len() >= 6);
 

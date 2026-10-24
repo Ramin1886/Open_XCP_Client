@@ -33,7 +33,13 @@ pub enum XcpError {
     A2lUpload(String),
     #[error("Calibration readback verification mismatch (wrote {expected:?}, read {actual:?})")]
     ReadbackMismatch { expected: Vec<u8>, actual: Vec<u8> },
+    #[error("Refusing to transfer {requested} bytes: above the {limit}-byte safety limit")]
+    TransferTooLarge { requested: usize, limit: usize },
 }
+
+/// Upper bound for any single chunked `UPLOAD` transfer (A2L text or memory read). The length
+/// comes from the target, so it must never be allowed to size an allocation unchecked.
+pub const MAX_UPLOAD_BYTES: usize = 64 * 1024 * 1024;
 
 /// High-level XCP Master Client.
 #[derive(Clone)]
@@ -114,6 +120,12 @@ impl XcpClient {
         {
             if res.len() >= 7 {
                 let a2l_len = u32::from_le_bytes([res[3], res[4], res[5], res[6]]) as usize;
+                if a2l_len > MAX_UPLOAD_BYTES {
+                    return Err(XcpError::TransferTooLarge {
+                        requested: a2l_len,
+                        limit: MAX_UPLOAD_BYTES,
+                    });
+                }
                 if a2l_len > 0 {
                     let raw_bytes = self.upload_from_current_mta(a2l_len).await?;
                     let text = String::from_utf8_lossy(&raw_bytes).into_owned();
@@ -131,6 +143,12 @@ impl XcpClient {
 
     /// Uploads `total_len` bytes starting from the target's current MTA using chunked `UPLOAD`.
     pub async fn upload_from_current_mta(&self, total_len: usize) -> Result<Vec<u8>, XcpError> {
+        if total_len > MAX_UPLOAD_BYTES {
+            return Err(XcpError::TransferTooLarge {
+                requested: total_len,
+                limit: MAX_UPLOAD_BYTES,
+            });
+        }
         let mut buffer = Vec::with_capacity(total_len);
         let max_chunk = (self.max_cto.saturating_sub(1)).clamp(1, 255);
 
