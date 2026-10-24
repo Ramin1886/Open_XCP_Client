@@ -8,7 +8,7 @@ paths:
 # XCP protocol invariants
 
 - `MAX_ODT_ENTRIES` and `MAX_ODTS_PER_DAQ_LIST` (`src/xcp/daq_planner.rs`) exist because ODT and entry numbers are single bytes in `ALLOC_ODT`, `ALLOC_ODT_ENTRY` and `SET_DAQ_PTR`. Never exceed them; measurements that do not fit are dropped and reported through `dropped_measurement_indices`, never truncated.
-- Usable ODT numbers must stay clear of reserved packet IDs 0xFC–0xFF (`invariants-check reserved_pid_limit` reports the current state).
+- Usable ODT numbers stay clear of reserved packet IDs 0xFC–0xFF: `MAX_ODTS_PER_DAQ_LIST` is 252 and `MAX_DAQ_LISTS` is 256 (`invariants-check reserved_pid_limit` fails the build otherwise).
 - ODT 0 of every DAQ list reserves the 4 timestamp bytes; the payload budget accounts for it.
 - A `DaqEventSample` is emitted only for a complete, in-order cycle. A lost ODT 0 discards the cycle without touching staging. Discards are counted with a `CycleDiscardReason`.
 - CTR accounting (`src/xcp/link_stats.rs`): 16-bit wraparound, gap/reorder/duplicate classification, a duplicate never rewinds the expectation. Transport queue overflows are counted, not hidden.

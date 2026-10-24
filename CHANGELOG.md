@@ -19,8 +19,24 @@ All notable changes to this project are documented here. The format follows
   readable by generic HDF5 tools). Minimum supported Rust version is 1.87.
 - CI: workspace-wide clippy, coverage gate scoped to the product crate, `--locked` builds.
 
+### Fixed
+- Recording I/O failures (part rotation, video frame, finalize, reconnect) now stop the recording,
+  report the stage and error in the status line and top bar, and leave the DAQ link running (T-06).
+- The worker thread is joined on exit so an open `.sdf` part is finalized before the process ends (T-07).
+- The local A2L file is a real fallback: the target upload runs first and the connect status says
+  which source was used (T-08).
+- A malformed `settings.json` is backed up as `settings.json.bak` and reported instead of being
+  silently replaced; settings are written atomically (T-12).
+- Submitting a calibration value while disconnected is refused instead of being shown as Synced (T-18).
+- Usable ODT numbers stay below the reserved packet IDs 0xFC..0xFF and DAQ lists are capped at 256 (T-20).
+- Short `GET_DAQ_CLOCK` replies no longer anchor the clock from reserved bytes (T-21).
+- `.sdf` dataset offsets from the file index are bounds-checked (T-23).
+- Upload lengths announced by the target and `MATRIX_DIM` products from the A2L are capped (T-11).
+- Integration tests poll with a deadline instead of sleeping, and assert outcomes (T-13).
+
 ### Removed
-- No-op `build.rs`; unused `ActiveTab::Logging`, `SizeSplitter::from_max_mb`, `build_ffmpeg_args`.
+- No-op `build.rs`; unused `ActiveTab::Logging`, `SizeSplitter::from_max_mb`, `build_ffmpeg_args` (T-28).
+- Unused `tokio` features `rt-multi-thread` and (from the library) `macros` (T-26).
 
 ## [0.2.0] - 2026-10-24
 
